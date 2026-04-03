@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment — never commit secrets
+.env
+
+# Logs
+*.log
+
+# IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Neo4j local data
+neo4j/
+
+# Temp
+/tmp/
