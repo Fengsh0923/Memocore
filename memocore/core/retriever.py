@@ -8,7 +8,7 @@ T5: 记忆召回函数 (v2: 加入二次筛选)
   → 精筛后的结果更精准，注入 system prompt 不会稀释信号
 
 用法：
-    from memos.core.retriever import MemoryRetriever
+    from memocore.core.retriever import MemoryRetriever
     retriever = MemoryRetriever()
     context = await retriever.retrieve("F哥对飞书通知的要求", agent_id="aoxia")
     # context 是可直接注入 system prompt 的 Markdown 文本

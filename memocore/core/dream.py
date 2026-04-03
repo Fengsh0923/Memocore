@@ -14,7 +14,7 @@ MemOS Dream 机制 — 记忆巩固（借鉴 Claude Code Dream 4阶段设计）
 - 过期信息降权或删除（> 30 天且未被引用）
 
 用法：
-    from memos.core.dream import run_dream
+    from memocore.core.dream import run_dream
     await run_dream(agent_id="aoxia")
 
     # 或作为独立脚本运行（供 cron / stop hook 调用）

@@ -64,7 +64,7 @@ async def run(data: dict):
         return
 
     sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-    from memos.core.extractor import extract_and_store
+    from memocore.core.extractor import extract_and_store
 
     source = f"桥接对话 | channel={channel} | session={session_id[:16]} | {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     logger.info(f"session={session_id[:16]} 开始写入，对话长度={len(conversation)}")

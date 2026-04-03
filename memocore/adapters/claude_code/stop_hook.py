@@ -32,7 +32,7 @@ import logging
 from pathlib import Path
 from datetime import datetime
 
-# 确保能 import memos
+# 确保能 import memocore
 _project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(_project_root))
 
@@ -80,8 +80,8 @@ def should_extract(transcript_text: str) -> bool:
 
 
 async def run(hook_input: dict):
-    from memos.core.extractor import extract_and_store
-    from memos.core.dream import run_dream
+    from memocore.core.extractor import extract_and_store
+    from memocore.core.dream import run_dream
 
     transcript = hook_input.get("transcript", [])
     session_id = hook_input.get("session_id", "unknown")

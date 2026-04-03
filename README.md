@@ -117,7 +117,7 @@ Supports `--dry-run` for safe inspection without modifying the graph.
 ### Install
 
 ```bash
-git clone https://github.com/Frankshen923/MemOS.git
+git clone https://github.com/Fengsh0923/memocore.git
 cd MemOS
 
 python3 -m venv .venv && source .venv/bin/activate
@@ -149,8 +149,8 @@ PYTHONPATH=. python3 examples/aoxia_demo/test_connection.py
 
 ```python
 import asyncio
-from memos.core.extractor import extract_and_store
-from memos.core.retriever import MemoryRetriever
+from memocore.core.extractor import extract_and_store
+from memocore.core.retriever import MemoryRetriever
 
 async def main():
     # Write a conversation into memory
@@ -203,7 +203,7 @@ Add to your `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/venv/bin/python3 /path/to/MemOS/memos/adapters/claude_code/prompt_hook.py",
+            "command": "/path/to/venv/bin/python3 /path/to/memocore/memos/adapters/claude_code/prompt_hook.py",
             "timeout": 25
           }
         ]
@@ -214,7 +214,7 @@ Add to your `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/venv/bin/python3 /path/to/MemOS/memos/adapters/claude_code/stop_hook.py",
+            "command": "/path/to/venv/bin/python3 /path/to/memocore/memos/adapters/claude_code/stop_hook.py",
             "timeout": 60
           }
         ]
@@ -235,7 +235,7 @@ The hooks are non-blocking — if MemOS is slow or unavailable, the conversation
 ## Project Structure
 
 ```
-MemOS/
+memocore/
 ├── memos/
 │   ├── core/
 │   │   ├── extractor.py       # Conversation → Graphiti extraction

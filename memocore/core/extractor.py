@@ -3,7 +3,7 @@ T4: 对话提炼脚本
 功能：把一段对话文本 → 提炼实体+关系 → 写入 Graphiti
 
 用法：
-    from memos.core.extractor import MemoryExtractor
+    from memocore.core.extractor import MemoryExtractor
     extractor = MemoryExtractor()
     await extractor.extract_and_store(conversation="...", agent_id="aoxia")
 """
@@ -23,7 +23,7 @@ if _env_path.exists():
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType
 
-from memos.agents.aoxia.schema import AOXIA_ENTITY_TYPES
+from memocore.agents.aoxia.schema import AOXIA_ENTITY_TYPES
 
 
 class MemoryExtractor:

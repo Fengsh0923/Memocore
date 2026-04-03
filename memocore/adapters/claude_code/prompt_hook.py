@@ -76,7 +76,7 @@ async def run(hook_input: dict) -> dict:
     session_id = hook_input.get("session_id", "unknown")
 
     sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-    from memos.core.retriever import MemoryRetriever
+    from memocore.core.retriever import MemoryRetriever
 
     retriever = MemoryRetriever()
     context_text = ""
