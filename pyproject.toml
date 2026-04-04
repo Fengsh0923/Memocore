@@ -11,13 +11,29 @@ dependencies = [
     "graphiti-core>=0.3",
     "neo4j>=5.0",
     "python-dotenv>=1.0",
-    "openai>=1.0",
     "pydantic>=2.0",
-    "anthropic>=0.20",
+    "click>=8.0",        # CLI 工具
+    # LLM provider（至少安装一个）
+    "anthropic>=0.20",   # 推荐；用于 LLM 提炼、rerank、Dream consolidate
+    "openai>=1.0",       # 备选；也是 Graphiti 默认 embedding provider
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "black", "ruff"]
+
+# 本地 embedding（无需 OpenAI key）
+local-embed = ["fastembed>=0.2"]
+local-embed-torch = ["sentence-transformers>=2.0"]
+
+# MCP Server（兼容 Claude Desktop / Cursor / Windsurf）
+mcp = ["mcp>=1.0"]
+
+# 全功能安装
+all = ["fastembed>=0.2", "mcp>=1.0"]
+
+[project.scripts]
+memocore = "memocore.cli.main:main"
+memocore-mcp = "memocore.adapters.mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -30,12 +30,17 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-_env_path = Path(__file__).parent.parent.parent.parent / ".env"
+_project_root = Path(__file__).parent.parent.parent.parent
+sys.path.insert(0, str(_project_root))
+
+_env_path = _project_root / ".env"
 if _env_path.exists():
     load_dotenv(_env_path)
 
-LOG_FILE = Path.home() / ".private" / "memos_bridge.log"
-LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+from memocore.core.config import get_agent_id, get_logs_dir
+from memocore.agents.aoxia.schema import AOXIA_PROFILE
+
+LOG_FILE = get_logs_dir() / "bridge_write.log"
 
 logging.basicConfig(
     filename=str(LOG_FILE),
@@ -43,6 +48,13 @@ logging.basicConfig(
     format="%(asctime)s [bridge_write] %(levelname)s %(message)s",
 )
 logger = logging.getLogger("memos.bridge_write")
+
+
+def _get_role_names(agent_id: str) -> tuple[str, str]:
+    if agent_id == "aoxia":
+        p = AOXIA_PROFILE
+        return p.get("user_display_name", "用户"), p.get("assistant_display_name", "助手")
+    return "用户", "助手"
 
 MIN_LENGTH = 100  # 少于100字不写入
 
@@ -52,18 +64,19 @@ async def run(data: dict):
     prompt = data.get("prompt", "").strip()
     response = data.get("response", "").strip()
     channel = data.get("channel", "bridge")
+    agent_id = get_agent_id()
 
     if not prompt and not response:
         logger.info(f"session={session_id[:16]} prompt和response都为空，跳过")
         return
 
-    conversation = f"用户：{prompt}\n鳌虾：{response}"
+    user_name, assistant_name = _get_role_names(agent_id)
+    conversation = f"{user_name}：{prompt}\n{assistant_name}：{response}"
 
     if len(conversation) < MIN_LENGTH:
         logger.info(f"session={session_id[:16]} 对话太短({len(conversation)}字)，跳过")
         return
 
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
     from memocore.core.extractor import extract_and_store
 
     source = f"桥接对话 | channel={channel} | session={session_id[:16]} | {datetime.now().strftime('%Y-%m-%d %H:%M')}"
@@ -71,7 +84,7 @@ async def run(data: dict):
 
     result = await extract_and_store(
         conversation=conversation,
-        agent_id="aoxia",
+        agent_id=agent_id,
         source_description=source,
     )
 

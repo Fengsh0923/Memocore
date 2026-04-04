@@ -221,6 +221,42 @@ AOXIA_ENTITY_TYPES: dict = {
     "ExternalResource": ExternalResource,
 }
 
+
+# ─── Agent 档案（供 core 模块使用，避免硬编码）────────────────────────────────
+
+AOXIA_PROFILE: dict = {
+    # 对话角色名称（用于 transcript 解析和 prompt 构建）
+    "user_display_name": "F哥",
+    "assistant_display_name": "鳌虾",
+
+    # 提炼指令：告诉 LLM 从对话里提取哪些内容
+    "extraction_instructions": """
+你正在处理 F哥（Frank）与 AI 助手鳌虾的对话记录。
+
+提炼重点：
+1. F哥表达的偏好、规则、判断标准 → FrankPreference
+2. 项目状态更新或决策 → ProjectStatus / Judgment
+3. 技术方案选择和理由 → Judgment
+4. 任务派发和结果 → TaskRecord
+5. 故障或踩坑 → Incident
+6. 服务端口、路径、API信息 → ExternalResource
+7. 飞虾队各虾的配置变更 → AgentConfig
+
+注意：
+- 只提炼明确表达的信息，不要推断
+- F哥说"好虾"表示认可，这之前的内容通常是已确认的判断
+- 技术细节（端口号、路径、API key位置）要精确提取
+""",
+
+    # 会话开始时的全量召回查询（覆盖用户最关心的三类信息）
+    "session_start_queries": [
+        "F哥最近的项目和决策",
+        "F哥的偏好规则和判断标准",
+        "飞虾队当前状态和任务",
+    ],
+}
+
+
 __all__ = [
     "FrankPreference",
     "ProjectStatus",
@@ -230,4 +266,5 @@ __all__ = [
     "Incident",
     "ExternalResource",
     "AOXIA_ENTITY_TYPES",
+    "AOXIA_PROFILE",
 ]

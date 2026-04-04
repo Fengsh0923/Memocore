@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from memocore.core.llm_adapter import chat_complete
+from memocore.core.config import get_dream_ttl_days
 
 _env_path = Path(__file__).parent.parent.parent / ".env"
 if _env_path.exists():
@@ -69,6 +71,10 @@ class DreamReport:
     pruned: int = 0
     kept: int = 0
 
+    # TTL + 置信度
+    expired: int = 0          # 超过 TTL 被删除的节点
+    confidence_lowered: int = 0  # 置信度被降低的节点
+
     # 状态
     status: str = "running"   # running / done / failed
     error: Optional[str] = None
@@ -81,7 +87,8 @@ class DreamReport:
         return (
             f"[Dream {self.agent_id}] {self.status}{elapsed} | "
             f"节点={self.total_nodes} edges={self.total_edges} | "
-            f"重复组={self.duplicate_groups} 矛盾对={self.conflict_pairs} 过期={self.stale_nodes} | "
+            f"重复={self.duplicate_groups} 矛盾={self.conflict_pairs} "
+            f"过期={self.stale_nodes} 到期删除={self.expired} 降权={self.confidence_lowered} | "
             f"合并={self.merged} 更新={self.updated} 剪枝={self.pruned} 保留={self.kept}"
         )
 
@@ -99,15 +106,14 @@ class DreamConsolidator:
         neo4j_uri: Optional[str] = None,
         neo4j_user: Optional[str] = None,
         neo4j_password: Optional[str] = None,
-        openai_api_key: Optional[str] = None,
         stale_days: int = 30,
         max_nodes_per_run: int = 200,
     ):
         self.neo4j_uri = neo4j_uri or os.getenv("NEO4J_URI", "bolt://localhost:7687")
         self.neo4j_user = neo4j_user or os.getenv("NEO4J_USER", "neo4j")
         self.neo4j_password = neo4j_password or os.getenv("NEO4J_PASSWORD", "")
-        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY", "")
         self.stale_days = stale_days
+        self.ttl_days = get_dream_ttl_days()
         self.max_nodes_per_run = max_nodes_per_run
         self._driver = None
 
@@ -314,9 +320,6 @@ class DreamConsolidator:
         if not tasks:
             return []
 
-        import openai
-        client = openai.AsyncOpenAI(api_key=self.openai_api_key)
-
         actions = []
 
         for task in tasks:
@@ -345,7 +348,7 @@ class DreamConsolidator:
 1. merge — 合并为一个，指定保留的 uuid（最完整的那个）
 2. skip — 数据不足，跳过
 
-仅返回 JSON：{{"action": "merge"|"skip", "keep_uuid": "...", "reason": "..."}}"""
+仅返回 JSON：{{"action": "merge或skip", "keep_uuid": "...", "reason": "..."}}"""
 
                 elif task["type"] == "conflict":
                     prompt = f"""你是记忆图谱清洁工。以下是两条可能矛盾的关系：
@@ -357,20 +360,19 @@ class DreamConsolidator:
 2. keep_both — 两条含义不同，都保留
 3. skip — 数据不足
 
-仅返回 JSON：{{"action": "keep_latest"|"keep_both"|"skip", "delete_uuid": "...", "reason": "..."}}"""
+仅返回 JSON：{{"action": "keep_latest或keep_both或skip", "delete_uuid": "...", "reason": "..."}}"""
 
                 else:
                     continue
 
-                response = await client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
+                content = await chat_complete(
+                    prompt=prompt,
                     max_tokens=200,
-                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                    json_mode=True,
                 )
 
-                decision = json.loads(response.choices[0].message.content)
+                decision = json.loads(content)
                 decision["task_type"] = task["type"]
                 actions.append(decision)
 
@@ -474,6 +476,93 @@ class DreamConsolidator:
 
         logger.info(f"[prune] 共执行 {executed} 次图谱变更")
 
+    # ── Phase 5: TTL 过期删除 ────────────────────────────────────────────────────
+
+    async def phase5_ttl_expire(self, agent_id: str, report: DreamReport):
+        """
+        删除超过 TTL 且 memocore_confidence < 0.3 的节点。
+        高置信度节点（>= 0.3）即使超过 TTL 也保留（重要记忆不强制删除）。
+        """
+        ttl_cutoff = datetime.now(timezone.utc) - timedelta(days=self.ttl_days)
+        driver = await self._get_driver()
+
+        async with driver.session() as session:
+            expire_q = """
+            MATCH (n {group_id: $gid})
+            WHERE n.created_at < $cutoff
+              AND (n.memocore_confidence IS NULL OR n.memocore_confidence < 0.3)
+              AND NOT (n)--()
+            WITH n LIMIT 200
+            DELETE n
+            RETURN count(n) AS deleted
+            """
+            r = await session.run(expire_q, gid=agent_id, cutoff=ttl_cutoff.isoformat())
+            rec = await r.single()
+            deleted = rec["deleted"] if rec else 0
+            report.expired = deleted
+            logger.info(f"[ttl] TTL 过期删除 {deleted} 个节点 (ttl={self.ttl_days}d)")
+
+    # ── Phase 6: 置信度衰减 ──────────────────────────────────────────────────────
+
+    async def phase6_decay_confidence(self, agent_id: str, report: DreamReport):
+        """
+        对长期未被引用的节点降低置信度评分。
+
+        规则：
+          - 节点 30 天内未被任何 edge 引用 → confidence 降低 0.1（最低 0.1）
+          - 新建节点默认 memocore_confidence = 1.0（不存在时视为 1.0）
+          - 置信度 >= 0.7：标记为 confirmed（优先召回）
+          - 置信度 0.3-0.7：标记为 tentative（正常召回）
+          - 置信度 < 0.3：标记为 stale（召回时降权）
+        """
+        idle_cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        driver = await self._get_driver()
+
+        async with driver.session() as session:
+            # 找出 30 天未被 edge 引用的节点
+            decay_q = """
+            MATCH (n {group_id: $gid})
+            WHERE n.created_at < $cutoff AND NOT (n)--()
+            SET n.memocore_confidence = CASE
+                WHEN n.memocore_confidence IS NULL THEN 0.9
+                WHEN n.memocore_confidence - 0.1 < 0.1 THEN 0.1
+                ELSE n.memocore_confidence - 0.1
+            END,
+            n.memocore_status = CASE
+                WHEN (CASE WHEN n.memocore_confidence IS NULL THEN 0.9
+                      ELSE n.memocore_confidence END) - 0.1 >= 0.7 THEN 'confirmed'
+                WHEN (CASE WHEN n.memocore_confidence IS NULL THEN 0.9
+                      ELSE n.memocore_confidence END) - 0.1 >= 0.3 THEN 'tentative'
+                ELSE 'stale'
+            END
+            WITH n LIMIT 500
+            RETURN count(n) AS updated
+            """
+            r = await session.run(decay_q, gid=agent_id, cutoff=idle_cutoff.isoformat())
+            rec = await r.single()
+            updated = rec["updated"] if rec else 0
+            report.confidence_lowered = updated
+            logger.info(f"[confidence] 降权 {updated} 个节点")
+
+            # 对有关联 edge 的节点恢复置信度（被引用 = 活跃 = 有价值）
+            restore_q = """
+            MATCH (n {group_id: $gid})
+            WHERE (n)--()
+              AND (n.memocore_confidence IS NULL OR n.memocore_confidence < 1.0)
+            SET n.memocore_confidence = CASE
+                WHEN n.memocore_confidence IS NULL THEN 1.0
+                WHEN n.memocore_confidence + 0.1 > 1.0 THEN 1.0
+                ELSE n.memocore_confidence + 0.1
+            END,
+            n.memocore_status = 'confirmed'
+            WITH n LIMIT 500
+            RETURN count(n) AS restored
+            """
+            r = await session.run(restore_q, gid=agent_id)
+            rec = await r.single()
+            restored = rec["restored"] if rec else 0
+            logger.info(f"[confidence] 恢复 {restored} 个活跃节点置信度")
+
 
 # ─── 主入口 ────────────────────────────────────────────────────────────────────
 
@@ -515,6 +604,16 @@ async def run_dream(
         else:
             logger.info("[phase4] Prune — 执行图谱清理")
             await consolidator.phase4_prune(actions, agent_id, report)
+
+        # Phase 5: TTL 过期删除
+        if not dry_run:
+            logger.info("[phase5] TTL — 删除超期低置信度节点")
+            await consolidator.phase5_ttl_expire(agent_id, report)
+
+        # Phase 6: 置信度衰减与恢复
+        if not dry_run:
+            logger.info("[phase6] Confidence — 更新节点置信度评分")
+            await consolidator.phase6_decay_confidence(agent_id, report)
 
         report.status = "done"
         report.finished_at = datetime.now(timezone.utc)

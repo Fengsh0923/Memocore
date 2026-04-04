@@ -20,15 +20,38 @@ _env_path = Path(__file__).parent.parent.parent / ".env"
 if _env_path.exists():
     load_dotenv(_env_path)
 
-from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType
 
-from memocore.agents.aoxia.schema import AOXIA_ENTITY_TYPES
+from memocore.agents.aoxia.schema import AOXIA_ENTITY_TYPES, AOXIA_PROFILE
+from memocore.core.graphiti_factory import build_graphiti
+
+
+def _load_agent_profile(agent_id: str) -> dict:
+    """
+    根据 agent_id 加载对应的 profile。
+    当前支持 aoxia；新增 agent 时在此扩展。
+    """
+    if agent_id == "aoxia":
+        return AOXIA_PROFILE
+    # 通用 fallback：无定制化提炼指令
+    return {
+        "user_display_name": "User",
+        "assistant_display_name": "Assistant",
+        "extraction_instructions": "",
+        "session_start_queries": ["recent decisions and preferences", "active projects"],
+    }
+
+
+def _load_entity_types(agent_id: str) -> dict:
+    """根据 agent_id 加载实体类型表"""
+    if agent_id == "aoxia":
+        return AOXIA_ENTITY_TYPES
+    return {}
 
 
 class MemoryExtractor:
     """
-    鳌虾记忆提炼器
+    记忆提炼器
     - 接收对话文本
     - 调用 Graphiti 提炼实体+关系
     - 写入 Neo4j
@@ -43,16 +66,16 @@ class MemoryExtractor:
         self.neo4j_uri = neo4j_uri or os.getenv("NEO4J_URI", "bolt://localhost:7687")
         self.neo4j_user = neo4j_user or os.getenv("NEO4J_USER", "neo4j")
         self.neo4j_password = neo4j_password or os.getenv("NEO4J_PASSWORD", "")
-        self._graphiti: Optional[Graphiti] = None
+        self._graphiti = None
 
-    async def _get_graphiti(self) -> Graphiti:
+    async def _get_graphiti(self):
         if self._graphiti is None:
-            self._graphiti = Graphiti(
+            self._graphiti = await build_graphiti(
                 uri=self.neo4j_uri,
                 user=self.neo4j_user,
                 password=self.neo4j_password,
+                build_indices=True,
             )
-            await self._graphiti.build_indices_and_constraints()
         return self._graphiti
 
     async def extract_and_store(
@@ -79,6 +102,17 @@ class MemoryExtractor:
         if not conversation or not conversation.strip():
             return {"success": False, "error": "对话内容为空"}
 
+        # 隐私过滤（写入前扫描）
+        from memocore.core.privacy import get_filter
+        privacy_filter = get_filter()
+        conversation, privacy_report = await privacy_filter.process_async(conversation)
+        if privacy_report.should_skip:
+            return {
+                "success": False,
+                "error": f"隐私过滤跳过: {privacy_report.skip_reason}",
+                "privacy_skip": True,
+            }
+
         if episode_name is None:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             episode_name = f"{agent_id}_{ts}"
@@ -89,24 +123,10 @@ class MemoryExtractor:
         try:
             graphiti = await self._get_graphiti()
 
-            # 提炼系统提示词：告诉 Graphiti 用哪些实体类型
-            extraction_instructions = """
-你正在处理 F哥（Frank）与 AI 助手鳌虾的对话记录。
-
-提炼重点：
-1. F哥表达的偏好、规则、判断标准 → FrankPreference
-2. 项目状态更新或决策 → ProjectStatus / Judgment
-3. 技术方案选择和理由 → Judgment
-4. 任务派发和结果 → TaskRecord
-5. 故障或踩坑 → Incident
-6. 服务端口、路径、API信息 → ExternalResource
-7. 飞虾队各虾的配置变更 → AgentConfig
-
-注意：
-- 只提炼明确表达的信息，不要推断
-- F哥说"好虾"表示认可，这之前的内容通常是已确认的判断
-- 技术细节（端口号、路径、API key位置）要精确提取
-"""
+            # 从 agent profile 加载提炼指令和实体类型
+            profile = _load_agent_profile(agent_id)
+            entity_types = _load_entity_types(agent_id)
+            extraction_instructions = profile.get("extraction_instructions", "")
 
             result = await graphiti.add_episode(
                 name=episode_name,
@@ -115,7 +135,7 @@ class MemoryExtractor:
                 reference_time=reference_time,
                 source=EpisodeType.message,
                 group_id=agent_id,
-                entity_types=AOXIA_ENTITY_TYPES,
+                entity_types=entity_types,
                 custom_extraction_instructions=extraction_instructions,
             )
 

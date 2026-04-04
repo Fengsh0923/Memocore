@@ -14,7 +14,6 @@ T5: 记忆召回函数 (v2: 加入二次筛选)
     # context 是可直接注入 system prompt 的 Markdown 文本
 """
 
-import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,8 +24,34 @@ _env_path = Path(__file__).parent.parent.parent / ".env"
 if _env_path.exists():
     load_dotenv(_env_path)
 
-from graphiti_core import Graphiti
 from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
+from memocore.core.llm_adapter import rerank as llm_rerank
+from memocore.core.graphiti_factory import build_graphiti
+from memocore.agents.aoxia.schema import AOXIA_PROFILE
+
+
+def _filter_by_confidence(results: list, min_confidence: float = 0.2) -> list:
+    """
+    过滤掉置信度过低的节点（memocore_confidence < min_confidence 或 status='stale'）
+    Graphiti edge 对象通常不直接携带这些属性，尝试读取；读不到则默认保留
+    """
+    filtered = []
+    for r in results:
+        confidence = getattr(r, 'memocore_confidence', None)
+        status = getattr(r, 'memocore_status', None)
+        # 如果节点已被标记为 stale 且置信度很低，跳过
+        if status == 'stale' and confidence is not None and confidence < min_confidence:
+            continue
+        filtered.append(r)
+    return filtered if filtered else results  # 若全被过滤则返回原列表（降级处理）
+
+
+def _get_profile(agent_id: str) -> dict:
+    if agent_id == "aoxia":
+        return AOXIA_PROFILE
+    return {
+        "session_start_queries": ["recent decisions and preferences", "active projects"],
+    }
 
 
 class MemoryRetriever:
@@ -42,21 +67,19 @@ class MemoryRetriever:
         neo4j_uri: Optional[str] = None,
         neo4j_user: Optional[str] = None,
         neo4j_password: Optional[str] = None,
-        openai_api_key: Optional[str] = None,
         top_k_stage1: int = 20,
         top_k_final: int = 5,
     ):
         self.neo4j_uri = neo4j_uri or os.getenv("NEO4J_URI", "bolt://localhost:7687")
         self.neo4j_user = neo4j_user or os.getenv("NEO4J_USER", "neo4j")
         self.neo4j_password = neo4j_password or os.getenv("NEO4J_PASSWORD", "")
-        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY", "")
         self.top_k_stage1 = top_k_stage1
         self.top_k_final = top_k_final
         self._graphiti: Optional[Graphiti] = None
 
-    async def _get_graphiti(self) -> Graphiti:
+    async def _get_graphiti(self):
         if self._graphiti is None:
-            self._graphiti = Graphiti(
+            self._graphiti = await build_graphiti(
                 uri=self.neo4j_uri,
                 user=self.neo4j_user,
                 password=self.neo4j_password,
@@ -69,59 +92,8 @@ class MemoryRetriever:
         candidates: list,
         top_k: int,
     ) -> list:
-        """
-        Stage 2: 用 gpt-4o-mini 对候选结果精筛
-        输入：query + 最多20条 fact 文本
-        输出：按相关性排序的 top_k 索引列表
-        """
-        if len(candidates) <= top_k:
-            return candidates  # 候选不超过 top_k，直接返回
-
-        try:
-            import openai
-            client = openai.AsyncOpenAI(api_key=self.openai_api_key)
-
-            # 构建候选列表文本
-            items = []
-            for i, r in enumerate(candidates):
-                fact = getattr(r, 'fact', None) or str(r)[:150]
-                items.append(f"{i}: {fact}")
-            candidates_text = "\n".join(items)
-
-            prompt = f"""你是记忆召回助手。用户当前的问题/上下文是：
-
-"{query}"
-
-以下是从知识图谱召回的候选记忆（共{len(candidates)}条）：
-
-{candidates_text}
-
-请从中选出最相关的 {top_k} 条，按相关性从高到低排序。
-仅返回 JSON 数组，包含选中条目的索引号，例如：[3, 0, 7, 1, 5]"""
-
-            response = await client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                max_tokens=100,
-            )
-
-            content = response.choices[0].message.content.strip()
-            # 提取 JSON 数组
-            import re
-            match = re.search(r'\[[\d,\s]+\]', content)
-            if match:
-                indices = json.loads(match.group())
-                selected = []
-                for idx in indices[:top_k]:
-                    if 0 <= idx < len(candidates):
-                        selected.append(candidates[idx])
-                return selected
-
-        except Exception:
-            pass  # 精筛失败时 fallback 到 top_k 截断
-
-        return candidates[:top_k]
+        """Stage 2: 通过 LLM adapter 对候选结果精筛"""
+        return await llm_rerank(query=query, candidates=candidates, top_k=top_k)
 
     async def retrieve(
         self,
@@ -161,7 +133,13 @@ class MemoryRetriever:
             if not results:
                 return ""
 
-            # Stage 2: 精筛（gpt-4o-mini rerank）
+            # 过滤置信度过低的 stale 节点
+            results = _filter_by_confidence(results)
+
+            if not results:
+                return ""
+
+            # Stage 2: 精筛（LLM rerank）
             if use_rerank and len(results) > top_k:
                 results = await self._rerank_with_llm(query, results, top_k)
 
@@ -180,13 +158,10 @@ class MemoryRetriever:
     ) -> str:
         """
         会话开始时的全量相关记忆召回
-        召回最近的项目状态、规则和判断
+        查询语句从 agent profile 读取，不再硬编码
         """
-        queries = [
-            "F哥最近的项目和决策",
-            "F哥的偏好规则和判断标准",
-            "飞虾队当前状态和任务",
-        ]
+        profile = _get_profile(agent_id)
+        queries = profile.get("session_start_queries", ["recent decisions", "active projects"])
 
         all_results = []
         graphiti = await self._get_graphiti()
@@ -224,7 +199,9 @@ class MemoryRetriever:
     ) -> str:
         """把召回结果格式化为 system prompt 可用的 Markdown"""
 
-        header = "## 鳌虾记忆召回\n" if is_session_start else "## 相关历史记忆\n"
+        profile = _get_profile(agent_id)
+        assistant_name = profile.get("assistant_display_name", "Memocore")
+        header = f"## {assistant_name}记忆召回\n" if is_session_start else "## 相关历史记忆\n"
         lines = [header]
         lines.append(f"*来源：{agent_id} 知识图谱 | {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n")
 

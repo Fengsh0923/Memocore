@@ -26,12 +26,16 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-_env_path = Path(__file__).parent.parent.parent.parent / ".env"
+_project_root = Path(__file__).parent.parent.parent.parent
+sys.path.insert(0, str(_project_root))
+
+_env_path = _project_root / ".env"
 if _env_path.exists():
     load_dotenv(_env_path)
 
-LOG_FILE = Path.home() / ".private" / "memos_prompt_hook.log"
-LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+from memocore.core.config import get_agent_id, get_sessions_dir, get_logs_dir
+
+LOG_FILE = get_logs_dir() / "prompt_hook.log"
 
 logging.basicConfig(
     filename=str(LOG_FILE),
@@ -40,13 +44,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("memos.prompt_hook")
 
-# Session 首次召回的 flag 文件前缀
-SESSION_FLAG_PREFIX = "/tmp/memos-session-"
-
 
 def is_first_message(session_id: str) -> bool:
-    """检查是否是该 session 的第一条用户消息"""
-    flag = Path(f"{SESSION_FLAG_PREFIX}{session_id[:16]}.flag")
+    """
+    检查是否是该 session 的第一条用户消息
+    flag 文件存储在 ~/.memocore/sessions/（重启不丢失，比 /tmp 可靠）
+    """
+    flag = get_sessions_dir() / f"session-{session_id[:16]}.flag"
     if flag.exists():
         return False
     flag.touch()
@@ -74,8 +78,8 @@ async def run(hook_input: dict) -> dict:
     """
     prompt = hook_input.get("prompt", "")
     session_id = hook_input.get("session_id", "unknown")
+    agent_id = get_agent_id()
 
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
     from memocore.core.retriever import MemoryRetriever
 
     retriever = MemoryRetriever()
@@ -88,7 +92,7 @@ async def run(hook_input: dict) -> dict:
             # Session 首条消息：完整背景包
             logger.info(f"session={session_id[:16]} 首条消息，触发全量记忆召回")
             context_text = await retriever.retrieve_for_session_start(
-                agent_id="aoxia",
+                agent_id=agent_id,
                 top_k=10,
             )
             logger.info(
@@ -101,7 +105,7 @@ async def run(hook_input: dict) -> dict:
             logger.info(f"session={session_id[:16]} 后续消息，基于 prompt 快速召回")
             context_text = await retriever.retrieve(
                 query=prompt,
-                agent_id="aoxia",
+                agent_id=agent_id,
                 top_k=5,
                 use_rerank=False,   # 跳过 LLM rerank，压缩延迟
             )
