@@ -25,11 +25,14 @@ dev = ["pytest", "pytest-asyncio", "black", "ruff"]
 local-embed = ["fastembed>=0.2"]
 local-embed-torch = ["sentence-transformers>=2.0"]
 
-# MCP Server（兼容 Claude Desktop / Cursor / Windsurf）
-mcp = ["mcp>=1.0"]
+# MCP Server - stdio 模式（兼容 Claude Desktop / Cursor / Windsurf）
+mcp = ["mcp[cli]>=1.0"]
+
+# MCP Server - HTTP 模式（企业多租户服务）
+mcp-http = ["mcp[cli]>=1.0", "uvicorn[standard]>=0.29"]
 
 # 全功能安装
-all = ["fastembed>=0.2", "mcp>=1.0"]
+all = ["fastembed>=0.2", "mcp[cli]>=1.0", "uvicorn[standard]>=0.29"]
 
 [project.scripts]
 memocore = "memocore.cli.main:main"
