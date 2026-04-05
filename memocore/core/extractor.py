@@ -85,16 +85,21 @@ class MemoryExtractor:
         source_description: str = "Claude Code 对话",
         episode_name: Optional[str] = None,
         reference_time: Optional[datetime] = None,
+        group_id: Optional[str] = None,
     ) -> dict:
         """
         核心方法：提炼对话内容并写入记忆图谱
 
         Args:
             conversation: 对话文本（可以是完整的 session 内容）
-            agent_id: Agent 标识，用于 Neo4j namespace 隔离
+            agent_id: Agent 标识，用于 profile 加载和默认 group_id
             source_description: 数据来源描述
             episode_name: 本次 episode 的名称（默认自动生成）
             reference_time: 参考时间（默认当前时间）
+            group_id: Neo4j namespace（显式传入时覆盖 agent_id）
+                      personal scope: 传 agent_id（默认）
+                      team scope:     传 "team:{team_id}"
+                      org scope:      传 "org:{tenant_id}"
 
         Returns:
             {success: bool, episode_name: str, entities_extracted: int, error: str}
@@ -128,13 +133,14 @@ class MemoryExtractor:
             entity_types = _load_entity_types(agent_id)
             extraction_instructions = profile.get("extraction_instructions", "")
 
+            effective_group_id = group_id if group_id else agent_id
             result = await graphiti.add_episode(
                 name=episode_name,
                 episode_body=conversation,
                 source_description=source_description,
                 reference_time=reference_time,
                 source=EpisodeType.message,
-                group_id=agent_id,
+                group_id=effective_group_id,
                 entity_types=entity_types,
                 custom_extraction_instructions=extraction_instructions,
             )

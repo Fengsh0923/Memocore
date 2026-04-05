@@ -139,6 +139,17 @@ def _is_first_message(session_id: str, agent_id: str) -> bool:
     return True
 
 
+# ── 多范围辅助 ─────────────────────────────────────────────────────────────────
+
+def _scope_to_group_id(scope: str, agent_id: str, team_id: Optional[str], tenant_id: Optional[str]) -> str:
+    """将 scope + 相关 ID 转换为 Neo4j group_id"""
+    if scope == "team" and team_id:
+        return f"team:{team_id}"
+    if scope == "org" and tenant_id:
+        return f"org:{tenant_id}"
+    return agent_id  # personal（默认）
+
+
 # ── Tool 1: memory_recall ──────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -147,10 +158,17 @@ async def memory_recall(
     session_id: str = "default",
     top_k: int = 5,
     agent_id: Optional[str] = None,
+    team_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> str:
     """
     根据当前 prompt 从记忆图谱召回最相关的历史记忆。
+
+    支持三种记忆范围的合并检索：
+    - 个人记忆（始终检索）
+    - 团队共享记忆（传入 team_id 时启用）
+    - 组织知识库（传入 tenant_id 时启用）
 
     在处理每条用户消息之前调用此工具，将返回的记忆注入到你的上下文中。
     如果是 session 的第一条消息，会自动触发全量背景召回。
@@ -160,16 +178,21 @@ async def memory_recall(
         session_id: 会话标识符，用于区分首次/后续消息
         top_k: 返回的记忆条数（默认 5）
         agent_id: Agent 唯一标识（HTTP 模式必填；stdio 模式从环境变量读取）
+        team_id: 团队 ID，传入后合并检索团队共享记忆
+        tenant_id: 组织 ID，传入后合并检索组织知识库
         api_key: API Key（当服务端配置了 MEMOCORE_API_KEY 时必填）
 
     Returns:
-        格式化的历史记忆文本，可直接注入系统提示
+        格式化的历史记忆文本（多范围结果标注 [个人]/[团队]/[组织] 来源）
     """
     if err := _check_api_key(api_key):
         return err
 
     resolved_agent_id = _resolve_agent_id(agent_id)
-    logger.info(f"memory_recall: agent={resolved_agent_id[:24]} session={session_id[:16]} query={query[:50]}")
+    logger.info(
+        f"memory_recall: agent={resolved_agent_id[:24]} session={session_id[:16]} "
+        f"team={team_id} tenant={tenant_id} query={query[:50]}"
+    )
 
     try:
         from memocore.core.retriever import MemoryRetriever
@@ -181,6 +204,8 @@ async def memory_recall(
                 result = await retriever.retrieve_for_session_start(
                     agent_id=resolved_agent_id,
                     top_k=max(top_k * 2, 10),
+                    team_id=team_id,
+                    tenant_id=tenant_id,
                 )
             else:
                 result = await retriever.retrieve(
@@ -188,6 +213,8 @@ async def memory_recall(
                     agent_id=resolved_agent_id,
                     top_k=top_k,
                     use_rerank=True,
+                    team_id=team_id,
+                    tenant_id=tenant_id,
                 )
         finally:
             await retriever.close()
@@ -210,28 +237,36 @@ async def memory_session_start(
     session_id: str = "default",
     top_k: int = 15,
     agent_id: Optional[str] = None,
+    team_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> str:
     """
     在新会话开始时调用，返回完整的历史背景记忆包。
 
     包括：最近项目状态、用户偏好规则、历史决策等。
+    支持合并个人、团队、组织三个范围的记忆。
     建议将返回内容注入到系统提示的开头。
 
     Args:
         session_id: 会话标识符
         top_k: 召回条数（默认 15，会话开始时返回更多背景）
         agent_id: Agent 唯一标识（HTTP 模式必填；stdio 模式从环境变量读取）
+        team_id: 团队 ID，传入后合并团队记忆
+        tenant_id: 组织 ID，传入后合并组织知识
         api_key: API Key（当服务端配置了 MEMOCORE_API_KEY 时必填）
 
     Returns:
-        格式化的背景记忆文本
+        格式化的背景记忆文本（多范围结果标注来源）
     """
     if err := _check_api_key(api_key):
         return err
 
     resolved_agent_id = _resolve_agent_id(agent_id)
-    logger.info(f"memory_session_start: agent={resolved_agent_id[:24]} session={session_id[:16]}")
+    logger.info(
+        f"memory_session_start: agent={resolved_agent_id[:24]} session={session_id[:16]} "
+        f"team={team_id} tenant={tenant_id}"
+    )
 
     # 标记为已初始化（避免 memory_recall 重复触发全量召回）
     safe_agent = resolved_agent_id.replace("/", "_").replace(":", "_")[:32]
@@ -245,6 +280,8 @@ async def memory_session_start(
             result = await retriever.retrieve_for_session_start(
                 agent_id=resolved_agent_id,
                 top_k=top_k,
+                team_id=team_id,
+                tenant_id=tenant_id,
             )
         finally:
             await retriever.close()
@@ -264,7 +301,10 @@ async def memory_store(
     conversation: str,
     session_id: str = "default",
     source: str = "MCP client",
+    scope: str = "personal",
     agent_id: Optional[str] = None,
+    team_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> str:
     """
@@ -277,7 +317,13 @@ async def memory_store(
         conversation: 要存储的对话文本（User/Assistant 格式）
         session_id: 会话标识符（用于日志追踪）
         source: 数据来源描述（默认 "MCP client"）
+        scope: 记忆范围
+               "personal" — 仅本 Agent 可读（默认）
+               "team"     — 团队共享（需传入 team_id）
+               "org"      — 组织知识库（需传入 tenant_id，通常由管理员写入）
         agent_id: Agent 唯一标识（HTTP 模式必填；stdio 模式从环境变量读取）
+        team_id: 团队 ID（scope="team" 时必填）
+        tenant_id: 组织 ID（scope="org" 时必填）
         api_key: API Key（当服务端配置了 MEMOCORE_API_KEY 时必填）
 
     Returns:
@@ -287,7 +333,11 @@ async def memory_store(
         return err
 
     resolved_agent_id = _resolve_agent_id(agent_id)
-    logger.info(f"memory_store: agent={resolved_agent_id[:24]} session={session_id[:16]} len={len(conversation)}")
+    group_id = _scope_to_group_id(scope, resolved_agent_id, team_id, tenant_id)
+    logger.info(
+        f"memory_store: agent={resolved_agent_id[:24]} session={session_id[:16]} "
+        f"scope={scope} group={group_id[:24]} len={len(conversation)}"
+    )
 
     if not conversation or not conversation.strip():
         return "跳过：对话内容为空"
@@ -300,7 +350,8 @@ async def memory_store(
         result = await extract_and_store(
             conversation=conversation,
             agent_id=resolved_agent_id,
-            source_description=f"{source} | session={session_id[:16]}",
+            source_description=f"{source} | scope={scope} | session={session_id[:16]}",
+            group_id=group_id,
         )
 
         if result["success"]:

@@ -95,6 +95,27 @@ class MemoryRetriever:
         """Stage 2: 通过 LLM adapter 对候选结果精筛"""
         return await llm_rerank(query=query, candidates=candidates, top_k=top_k)
 
+    async def _search_scoped(
+        self,
+        graphiti,
+        query: str,
+        group_ids: list[str],
+        num_results: int,
+        scope_label: str,
+    ) -> list:
+        """对单个 scope 执行搜索，并在结果上打标（_scope_label 属性）"""
+        try:
+            results = await graphiti.search(
+                query=query,
+                group_ids=group_ids,
+                num_results=num_results,
+            )
+            for r in results:
+                r._scope_label = scope_label
+            return results
+        except Exception:
+            return []
+
     async def retrieve(
         self,
         query: str,
@@ -102,51 +123,72 @@ class MemoryRetriever:
         top_k: int = 5,
         use_rerank: bool = True,
         as_markdown: bool = True,
+        team_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> str:
         """
-        召回与 query 最相关的历史记忆
+        召回与 query 最相关的历史记忆，支持多范围合并检索
 
         Args:
             query: 当前对话上下文或关键词
-            agent_id: Agent namespace，默认 aoxia
-            top_k: 最终返回条数（精筛后），默认5
-            use_rerank: True 时启用二次精筛（Stage 2），False 直接返回 Stage 1 结果
-            as_markdown: True 返回可注入 system prompt 的 Markdown，False 返回原始结果
+            agent_id: 个人 namespace
+            top_k: 最终返回条数，默认 5
+            use_rerank: 启用 LLM 二次精筛
+            as_markdown: True 返回 Markdown，False 返回原始结果
+            team_id: 团队 ID，传入后同时检索团队记忆
+            tenant_id: 组织 ID，传入后同时检索组织知识
 
         Returns:
             格式化的记忆文本，可直接放入 system prompt
         """
+        import asyncio as _asyncio
+
         if not query.strip():
             return ""
 
         try:
             graphiti = await self._get_graphiti()
-
-            # Stage 1: 粗筛（top_k_stage1，默认20）
             stage1_k = self.top_k_stage1 if use_rerank else top_k
-            results = await graphiti.search(
-                query=query,
-                group_ids=[agent_id],
-                num_results=stage1_k,
-            )
 
-            if not results:
+            # 构建多 scope 并行查询任务
+            search_tasks = [
+                self._search_scoped(graphiti, query, [agent_id], stage1_k, "个人")
+            ]
+            if team_id:
+                search_tasks.append(
+                    self._search_scoped(graphiti, query, [f"team:{team_id}"], stage1_k // 2, "团队")
+                )
+            if tenant_id:
+                search_tasks.append(
+                    self._search_scoped(graphiti, query, [f"org:{tenant_id}"], stage1_k // 2, "组织")
+                )
+
+            scoped_results = await _asyncio.gather(*search_tasks)
+
+            # 合并，去重（按 uuid）
+            seen = set()
+            all_results = []
+            for batch in scoped_results:
+                for r in batch:
+                    uid = getattr(r, 'uuid', id(r))
+                    if uid not in seen:
+                        seen.add(uid)
+                        all_results.append(r)
+
+            if not all_results:
                 return ""
 
             # 过滤置信度过低的 stale 节点
-            results = _filter_by_confidence(results)
+            all_results = _filter_by_confidence(all_results)
 
-            if not results:
-                return ""
-
-            # Stage 2: 精筛（LLM rerank）
-            if use_rerank and len(results) > top_k:
-                results = await self._rerank_with_llm(query, results, top_k)
+            # Stage 2: LLM 精筛
+            if use_rerank and len(all_results) > top_k:
+                all_results = await self._rerank_with_llm(query, all_results, top_k)
 
             if not as_markdown:
-                return str(results)
+                return str(all_results)
 
-            return self._format_as_context(results, agent_id)
+            return self._format_as_context(all_results, agent_id)
 
         except Exception as e:
             return f"<!-- 记忆召回失败: {e} -->"
@@ -155,39 +197,49 @@ class MemoryRetriever:
         self,
         agent_id: str = "aoxia",
         top_k: int = 15,
+        team_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> str:
         """
-        会话开始时的全量相关记忆召回
-        查询语句从 agent profile 读取，不再硬编码
+        会话开始时的全量相关记忆召回，支持多范围
+
+        Args:
+            agent_id: 个人 namespace
+            top_k: 召回总条数
+            team_id: 传入后同时召回团队记忆
+            tenant_id: 传入后同时召回组织知识
         """
+        import asyncio as _asyncio
+
         profile = _get_profile(agent_id)
         queries = profile.get("session_start_queries", ["recent decisions", "active projects"])
 
-        all_results = []
+        # 构建每个 scope 的召回任务（每个 query × 每个 scope）
         graphiti = await self._get_graphiti()
+        per_query_k = max(1, top_k // len(queries))
 
+        tasks = []
         for q in queries:
-            try:
-                results = await graphiti.search(
-                    query=q,
-                    group_ids=[agent_id],
-                    num_results=top_k // len(queries),
-                )
-                all_results.extend(results)
-            except Exception:
-                continue
+            tasks.append(self._search_scoped(graphiti, q, [agent_id], per_query_k, "个人"))
+            if team_id:
+                tasks.append(self._search_scoped(graphiti, q, [f"team:{team_id}"], per_query_k // 2, "团队"))
+            if tenant_id:
+                tasks.append(self._search_scoped(graphiti, q, [f"org:{tenant_id}"], per_query_k // 2, "组织"))
 
-        if not all_results:
-            return ""
+        all_batches = await _asyncio.gather(*tasks)
 
-        # 去重（按 uuid）
+        # 合并去重
         seen = set()
         unique_results = []
-        for r in all_results:
-            uid = getattr(r, 'uuid', str(r))
-            if uid not in seen:
-                seen.add(uid)
-                unique_results.append(r)
+        for batch in all_batches:
+            for r in batch:
+                uid = getattr(r, 'uuid', id(r))
+                if uid not in seen:
+                    seen.add(uid)
+                    unique_results.append(r)
+
+        if not unique_results:
+            return ""
 
         return self._format_as_context(unique_results, agent_id, is_session_start=True)
 
@@ -197,7 +249,7 @@ class MemoryRetriever:
         agent_id: str,
         is_session_start: bool = False,
     ) -> str:
-        """把召回结果格式化为 system prompt 可用的 Markdown"""
+        """把召回结果格式化为 system prompt 可用的 Markdown，多范围结果标注来源"""
 
         profile = _get_profile(agent_id)
         assistant_name = profile.get("assistant_display_name", "Memocore")
@@ -206,13 +258,14 @@ class MemoryRetriever:
         lines.append(f"*来源：{agent_id} 知识图谱 | {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n")
 
         for i, r in enumerate(results, 1):
-            # Graphiti 返回的是 edge 对象，尝试提取 fact 字段
             fact = getattr(r, 'fact', None)
+            scope_label = getattr(r, '_scope_label', None)
+            prefix = f"[{scope_label}] " if scope_label else ""
+
             if fact:
-                lines.append(f"{i}. {fact}")
+                lines.append(f"{i}. {prefix}{fact}")
             else:
-                # fallback：取字符串表示的前200字
-                lines.append(f"{i}. {str(r)[:200]}")
+                lines.append(f"{i}. {prefix}{str(r)[:200]}")
 
         return "\n".join(lines)
 
