@@ -42,7 +42,7 @@ async def llm_rerank_titles(query: str, pages: list[dict], top_k: int) -> list[d
     indices = parse_llm_json(content)
     if not isinstance(indices, list):
         logger.warning(f"rerank returned non-list: {type(indices)}, falling back")
-        return all_pages[:top_k]
+        return pages[:top_k]
     return [pages[i] for i in indices if 0 <= i < len(pages)]
 
 

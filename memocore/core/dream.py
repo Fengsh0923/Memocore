@@ -553,13 +553,13 @@ class DreamConsolidator:
             MATCH (n {group_id: $gid})
             WHERE (n)--()
               AND (n.memocore_confidence IS NULL OR n.memocore_confidence < 1.0)
+            WITH n LIMIT 500
             SET n.memocore_confidence = CASE
                 WHEN n.memocore_confidence IS NULL THEN 1.0
                 WHEN n.memocore_confidence + 0.1 > 1.0 THEN 1.0
                 ELSE n.memocore_confidence + 0.1
             END,
             n.memocore_status = 'confirmed'
-            WITH n LIMIT 500
             RETURN count(n) AS restored
             """
             r = await session.run(restore_q, gid=agent_id)
@@ -969,8 +969,8 @@ async def run_dream(
     Returns:
         DreamReport — run report
     """
-    report = DreamReport(agent_id=agent_id)
     agent_id = validate_agent_id(agent_id)
+    report = DreamReport(agent_id=agent_id)
     consolidator = DreamConsolidator()
 
     # clean up stale session flag files (prevent accumulation of millions of files)

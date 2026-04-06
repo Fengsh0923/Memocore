@@ -248,13 +248,31 @@ def reset_session_counter(agent_id: str) -> None:
 
 
 def should_run_dream(agent_id: str) -> bool:
-    """Check if dream should run. Uses atomic file locking to prevent race conditions."""
+    """Check if dream should run. Atomic increment+check+reset under a single file lock."""
     interval = get_dream_interval()
-    count = increment_session_counter(agent_id)
-    if count >= interval:
-        reset_session_counter(agent_id)
-        return True
-    return False
+    path = _get_counter_path(agent_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = os.read(fd, 64).decode().strip()
+        current = int(data) if data else 0
+        current += 1
+        if current >= interval:
+            # Reset and signal dream
+            current = 0
+            trigger = True
+        else:
+            trigger = False
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, str(current).encode())
+        return trigger
+    except (ValueError, OSError):
+        return False
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 # ── Privacy configuration ────────────────────────────────────────────────────

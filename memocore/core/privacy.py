@@ -60,8 +60,8 @@ _REDACT_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     ), r'\1://[USER]:[PASSWORD]@'),
     # CLI password parameters --password xxx / -p xxx / password=xxx
     ("cli_password", re.compile(
-        r'(?i)(?:--password|-p\s+|password[=\s]+)([^\s\'"]{4,})'
-    ), "[PASSWORD]"),
+        r'(?i)((?:--password|password)[=\s]+|-p\s+)([^\s\'"]{4,})'
+    ), r'\1[PASSWORD]'),
     # AWS Access Key / Secret
     ("aws_key", re.compile(r'\b(AKIA|ASIA)[A-Z0-9]{16}\b'), "[AWS_KEY]"),
     ("aws_secret", re.compile(
