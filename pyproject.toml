@@ -1,24 +1,44 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "memocore"
-version = "0.1.0"
-description = "Agent universal memory layer — powered by Graphiti"
+version = "1.0.0"
+description = "Agent universal memory layer — persistent memory for AI agents, powered by Neo4j + Graphiti"
 requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "Memocore Team"},
+]
+keywords = ["ai", "agent", "memory", "neo4j", "graphiti", "mcp", "llm"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "graphiti-core>=0.3",
     "neo4j>=5.0",
     "python-dotenv>=1.0",
     "pydantic>=2.0",
-    "click>=8.0",        # CLI 工具
-    # LLM provider（至少安装一个）
-    "anthropic>=0.20",   # 推荐；用于 LLM 提炼、rerank、Dream consolidate
-    "openai>=1.0",       # 备选；也是 Graphiti 默认 embedding provider
+    "click>=8.0",
 ]
 
 [project.optional-dependencies]
+# LLM providers（至少安装一个）
+llm = [
+    "anthropic>=0.20",
+    "openai>=1.0",
+]
+anthropic = ["anthropic>=0.20"]
+openai = ["openai>=1.0"]
+
 dev = ["pytest", "pytest-asyncio", "black", "ruff"]
 
 # 本地 embedding（无需 OpenAI key）
@@ -31,8 +51,14 @@ mcp = ["mcp[cli]>=1.0"]
 # MCP Server - HTTP 模式（企业多租户服务）
 mcp-http = ["mcp[cli]>=1.0", "uvicorn[standard]>=0.29"]
 
-# 全功能安装
-all = ["fastembed>=0.2", "mcp[cli]>=1.0", "uvicorn[standard]>=0.29"]
+# 全功能安装（含 LLM providers）
+all = [
+    "anthropic>=0.20",
+    "openai>=1.0",
+    "fastembed>=0.2",
+    "mcp[cli]>=1.0",
+    "uvicorn[standard]>=0.29",
+]
 
 [project.scripts]
 memocore = "memocore.cli.main:main"

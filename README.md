@@ -1,151 +1,167 @@
-# MemOS — Agent Universal Memory Layer
+# Memocore — AI Agent 持久化记忆层
 
-> Give your AI agents a persistent, self-healing memory.  
-> Built on [Graphiti](https://github.com/getzep/graphiti) + Neo4j, designed for [Claude Code](https://claude.ai/code) hooks.
-
----
-
-## The Problem
-
-Every time you start a new conversation with an AI agent, it forgets everything.  
-You re-explain your preferences. You repeat project context. You remind it of decisions made last week.
-
-This is the **missing memory layer** problem — and it's the biggest blocker to agents becoming truly useful coworkers.
-
-## What MemOS Does
-
-MemOS is a universal memory layer that plugs into AI agents via hooks. It:
-
-- **Automatically extracts** structured knowledge from conversations after each session
-- **Automatically recalls** relevant memories at the start of each new conversation
-- **Self-heals** its knowledge graph via periodic Dream consolidation (dedup, conflict resolution, stale pruning)
-- **Stays actionable** — every memory carries metadata on *when to save* and *how to apply*
-
-The result: your agent wakes up each session already knowing your preferences, project status, past decisions, and recurring patterns — without you saying a word.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Claude Code Session                   │
-│                                                         │
-│  UserPromptSubmit ──► prompt_hook.py                    │
-│         │                (recall → additionalContext)   │
-│         ▼                                               │
-│   [ Conversation ]  ◄── memories injected automatically │
-│         │                                               │
-│  Stop ──► stop_hook.py ──► extract_and_store()          │
-│                (write)       + Dream consolidation       │
-└─────────────────────────────────────────────────────────┘
-                          │
-              ┌───────────▼───────────┐
-              │   Graphiti Engine     │
-              │  temporal KG + RAG    │
-              └───────────┬───────────┘
-                          │
-              ┌───────────▼───────────┐
-              │   Neo4j Graph DB      │
-              │  nodes + edges        │
-              │  + vector embeddings  │
-              └───────────────────────┘
-```
-
-**Three core loops:**
-
-| Loop | Trigger | What happens |
-|------|---------|-------------|
-| **Write** | Session ends (Stop hook) | Conversation → LLM extraction → structured entities → Neo4j |
-| **Recall** | Each user message (UserPromptSubmit hook) | Query → vector search → LLM rerank → inject as `additionalContext` |
-| **Dream** | Every ~5 sessions (async, post-write) | Scan graph → find duplicates/conflicts/stale nodes → prune |
-
-## Key Features
-
-### Typed Entity Schema
-Seven entity types — easily customizable for your own agent context:
-
-| Entity | What it captures |
-|--------|-----------------|
-| `FrankPreference` | Behavioral rules, aesthetic standards, communication norms |
-| `ProjectStatus` | Active projects, current phase, next steps, key decisions |
-| `Judgment` | Confirmed conclusions, technical choices, strategic decisions |
-| `AgentConfig` | Agent team configuration, schedules, known issues |
-| `TaskRecord` | Task execution history and lessons learned |
-| `Incident` | Bugs, incidents, root causes, prevention checklist |
-| `ExternalResource` | Service ports, API endpoints, file paths |
-
-Every entity carries two meta-fields that make memories actionable:
-- `when_to_save` — what context triggers saving this memory
-- `how_to_apply` — how to use this memory when it's recalled
-
-### Two-Stage Recall
-```
-User prompt
-    │
-    ▼
-Stage 1: Graphiti vector + graph search  →  top 20 candidates
-    │
-    ▼
-Stage 2: gpt-4o-mini relevance rerank    →  top 5 injected
-```
-The LLM rerank step cuts noise significantly vs. a pure similarity threshold.  
-Stage 2 can be disabled (`use_rerank=False`) when latency matters more than precision.
-
-### Dream Consolidation (4 phases)
-
-The knowledge graph degrades without maintenance — duplicate nodes accumulate, facts contradict each other, stale orphans pile up. Dream runs automatically every ~5 sessions:
-
-```
-Phase 1  Orient      — scan graph, identify problem areas
-Phase 2  Gather      — bundle candidates into task packages
-Phase 3  Consolidate — gpt-4o-mini: merge / keep_latest / delete / skip
-Phase 4  Prune       — execute Neo4j changes, write action log
-```
-
-Supports `--dry-run` for safe inspection without modifying the graph.
+> 让你的 AI Agent 拥有持久、自愈的记忆。
+> 基于 [Graphiti](https://github.com/getzep/graphiti) + Neo4j 构建，支持 Claude Code Hooks / MCP / IM Bridge 多种接入方式。
 
 ---
 
-## Getting Started
+## 核心问题
 
-### Prerequisites
+每次开始新对话，AI Agent 都会忘记一切——你的偏好、项目背景、上周的决策。
+**Memocore** 是解决这个问题的通用记忆层。
 
-- Python ≥ 3.10
-- Neo4j running locally or in the cloud — [Neo4j Desktop](https://neo4j.com/download/)
-- OpenAI API key
-- Claude Code (for hook integration)
+## Memocore 做什么
 
-### Install
+- **自动提取**: 对话结束后，LLM 自动从对话中提取结构化知识实体
+- **自动召回**: 每条消息前，自动检索相关历史记忆注入上下文
+- **自我维护**: 定期 Dream 巩固——去重、冲突解决、过期清理、知识编译
+- **多租户隔离**: 每个 `agent_id` 是独立命名空间，4000+ Agent 可共享同一 Neo4j 实例
+- **多语言**: 默认中文，所有 LLM 提示和 UI 字符串支持 zh/en 切换 (`MEMOCORE_LANG`)
+
+## 架构
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                      AI Agent 对话                         │
+│                                                            │
+│  每条消息 ──► prompt_hook / MCP recall                     │
+│       │         (检索记忆 → 注入上下文)                     │
+│       ▼                                                    │
+│   [ 对话进行中 ]  ◄── 历史记忆自动注入                      │
+│       │                                                    │
+│  对话结束 ──► stop_hook / MCP store                        │
+│                 (提取知识 → 写入图谱)                       │
+│                 + Dream 巩固 (每 ~5 次对话)                 │
+└────────────────────────────────────────────────────────────┘
+                        │
+            ┌───────────▼───────────┐
+            │   Graphiti Engine     │
+            │  时序知识图谱 + RAG    │
+            └───────────┬───────────┘
+                        │
+            ┌───────────▼───────────┐
+            │   Neo4j Graph DB      │
+            │  节点 + 关系 + 向量    │
+            └───────────────────────┘
+```
+
+**三个核心循环:**
+
+| 循环 | 触发时机 | 功能 |
+|------|---------|------|
+| **写入** | 对话结束 | 对话 → LLM 提取 → 结构化实体 → Neo4j |
+| **召回** | 每条用户消息 | 查询 → 向量搜索 → LLM 重排 → 注入上下文 |
+| **Dream** | 每 ~5 次对话 (异步) | 去重 → 冲突解决 → 过期清理 → 知识编译 → 健康报告 |
+
+## 主要特性
+
+### 插件化 Agent Profile
+
+通过 Registry 注册自定义 Agent 配置，每个 Agent 可以有独立的实体类型和提取策略:
+
+```python
+from memocore.agents.registry import register_profile
+
+register_profile("my-agent", {
+    "user_display_name": "Alice",
+    "assistant_display_name": "Bot",
+    "extraction_instructions": "从对话中提取用户偏好和决策...",
+    "session_start_queries": ["最近的项目进展", "用户偏好"],
+}, entity_types=MY_ENTITY_TYPES)
+```
+
+未注册的 Agent 自动使用默认 Profile（支持 GenericPreference / GenericDecision / GenericTask 三种通用实体类型）。
+
+### 两阶段召回
+
+```
+用户提问 → 向量 + 图谱混合搜索 (top 20) → LLM 重排序 (top 5) → 注入上下文
+```
+
+LLM 重排可关闭 (`use_rerank=False`) 以降低延迟。首条消息自动触发全量召回（编译知识页 + 实体概览）。
+
+### Dream 巩固 (8 阶段)
+
+知识图谱会随时间退化——重复节点堆积、事实矛盾、孤立节点膨胀。Dream 自动维护:
+
+| 阶段 | 功能 |
+|------|------|
+| Phase 1-2 | 扫描图谱，识别重复/矛盾/孤立候选 |
+| Phase 3-4 | LLM 决策: 合并/保留最新/删除/跳过，执行变更 |
+| Phase 5-6 | TTL 过期清理，置信度衰减/恢复 |
+| Phase 7 | 知识编译: 将碎片事实编译为结构化知识页 (Karpathy LLM Wiki) |
+| Phase 8 | 健康检查: 生成 Lint 报告 (矛盾/孤立/缺失/过期) |
+
+### 多接入方式
+
+| 适配器 | 场景 | 说明 |
+|--------|------|------|
+| **Claude Code Hooks** | 个人开发 | prompt_hook + stop_hook，零配置自动记忆 |
+| **MCP Server** | stdio / HTTP | 支持 Claude Desktop, Cursor 等 MCP 客户端；HTTP 模式支持多租户 |
+| **IM Bridge** | Slack/Teams 等 | bridge_read + bridge_write，IM 消息自动记忆 |
+
+### 隐私保护
+
+- 内置正则规则自动脱敏 (API Key, 密码, 手机号, 身份证号等)
+- 可选 LLM 二次审查
+- 黑名单关键词跳过
+- 通过 `MEMOCORE_PRIVACY_ENABLED` 开关
+
+### 生产级特性 (v1.0)
+
+- **并发安全**: session counter 使用 `fcntl` 文件锁；lazy-init 使用 `asyncio.Lock` / `threading.Lock`
+- **LLM 超时**: Dream 所有 LLM 调用 60s 超时，不会无限阻塞
+- **输入校验**: 所有入口 `validate_agent_id()` 防路径穿越和注入
+- **安全路径**: 文件名使用 `make_safe_agent_key()` (SHA-256 哈希) 防碰撞
+- **日志隔离**: 库模块不调用 `logging.basicConfig()`，不污染宿主应用日志
+- **容器兼容**: `Path.home()` 失败时自动降级到 `/tmp/.memocore`
+
+---
+
+## 快速开始
+
+### 前置条件
+
+- Python >= 3.10
+- Neo4j (本地或云端) — [Neo4j Desktop](https://neo4j.com/download/)
+- Anthropic 或 OpenAI API Key
+
+### 安装
 
 ```bash
 git clone https://github.com/Fengsh0923/memocore.git
-cd MemOS
-
+cd Memocore
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
 
-### Configure
+### 配置
 
 ```bash
+# 交互式配置向导
+memocore init
+
+# 或手动
 cp .env.example .env
-# Fill in your credentials
+# 编辑 .env 填入 API Key 和 Neo4j 信息
 ```
 
+关键配置项:
 ```env
 NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
 NEO4J_PASSWORD=your_password
-OPENAI_API_KEY=sk-...
-DEFAULT_AGENT_ID=my_agent
+ANTHROPIC_API_KEY=sk-ant-...
+MEMOCORE_AGENT_ID=my-agent
+MEMOCORE_LANG=zh          # zh (默认) 或 en
 ```
 
-### Verify the connection
+### 验证连接
 
 ```bash
-PYTHONPATH=. python3 examples/aoxia_demo/test_connection.py
+memocore stats
 ```
 
-### Core API usage
+### API 用法
 
 ```python
 import asyncio
@@ -153,148 +169,155 @@ from memocore.core.extractor import extract_and_store
 from memocore.core.retriever import MemoryRetriever
 
 async def main():
-    # Write a conversation into memory
+    # 写入对话记忆
     result = await extract_and_store(
-        conversation="""
-        User: we decided to use Graphiti for the memory layer.
-        Agent: confirmed, storing that decision.
-        """,
-        agent_id="my_agent",
+        conversation="User: 我们决定用 Graphiti 做记忆层\nAssistant: 好的，记录这个决策",
+        agent_id="my-agent",
     )
-    print(result)
-    # → {'success': True, 'entities_extracted': 3, 'episode_name': '...'}
+    print(result)  # {'success': True, 'entities_extracted': 1, ...}
 
-    # Recall relevant memories
+    # 召回相关记忆
     retriever = MemoryRetriever()
     context = await retriever.retrieve(
-        query="memory layer technology choice",
-        agent_id="my_agent",
+        query="记忆层的技术选型",
+        agent_id="my-agent",
         top_k=5,
-        use_rerank=True,
     )
-    print(context)
-    # → Markdown text, ready to inject into a system prompt
+    print(context)  # Markdown 格式，可直接注入 system prompt
     await retriever.close()
 
 asyncio.run(main())
 ```
 
-### Run Dream consolidation
+### Dream 巩固
 
 ```bash
-# Dry run — inspect what would change without touching the graph
-PYTHONPATH=. python3 -m memos.core.dream --agent-id my_agent --dry-run
+# 试运行 (不修改图谱)
+python -m memocore.core.dream --agent-id my-agent --dry-run
 
-# Live run
-PYTHONPATH=. python3 -m memos.core.dream --agent-id my_agent
+# 正式运行
+python -m memocore.core.dream --agent-id my-agent
+```
+
+### CLI 工具
+
+```bash
+memocore list                          # 列出最近的记忆节点
+memocore search "通知规则"              # 语义搜索
+memocore browse                        # 浏览编译知识页
+memocore browse --report               # 查看 Lint 健康报告
+memocore export --format md -o mem.md  # 导出
+memocore delete UUID                   # 删除节点
+memocore privacy-scan "测试文本"        # 预览隐私过滤
 ```
 
 ---
 
-## Claude Code Hook Integration
+## Claude Code Hook 集成
 
-Add to your `~/.claude/settings.json`:
+在 `~/.claude/settings.json` 中添加:
 
 ```json
 {
   "hooks": {
     "UserPromptSubmit": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/path/to/venv/bin/python3 /path/to/memocore/memos/adapters/claude_code/prompt_hook.py",
-            "timeout": 25
-          }
-        ]
+        "hooks": [{
+          "type": "command",
+          "command": "python3 -m memocore.adapters.claude_code.prompt_hook",
+          "timeout": 25
+        }]
       }
     ],
     "Stop": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/path/to/venv/bin/python3 /path/to/memocore/memos/adapters/claude_code/stop_hook.py",
-            "timeout": 60
-          }
-        ]
+        "hooks": [{
+          "type": "command",
+          "command": "python3 -m memocore.adapters.claude_code.stop_hook",
+          "timeout": 60
+        }]
       }
     ]
   }
 }
 ```
 
-After this:
-- Every new conversation **starts** with relevant memories injected as context
-- Every conversation that ends **writes** extracted knowledge back to the graph
+## MCP Server
 
-The hooks are non-blocking — if MemOS is slow or unavailable, the conversation continues normally.
+```bash
+# stdio 模式 (个人使用，配合 Claude Desktop)
+memocore-mcp
+
+# HTTP 模式 (企业多租户)
+memocore-mcp --transport http --host 0.0.0.0 --port 8765
+```
 
 ---
 
-## Project Structure
+## 项目结构
 
 ```
-memocore/
-├── memos/
+Memocore/
+├── memocore/
 │   ├── core/
-│   │   ├── extractor.py       # Conversation → Graphiti extraction
-│   │   ├── retriever.py       # Two-stage recall (vector + LLM rerank)
-│   │   └── dream.py           # 4-phase memory consolidation
+│   │   ├── config.py         # 集中配置 + 输入校验
+│   │   ├── extractor.py      # 对话 → 知识提取
+│   │   ├── retriever.py      # 两阶段记忆召回
+│   │   ├── dream.py          # 8 阶段记忆巩固
+│   │   ├── embedder.py       # 向量嵌入 (OpenAI / fastembed / sentence-transformers)
+│   │   ├── llm_adapter.py    # LLM 调用层 (Anthropic + OpenAI 双 fallback)
+│   │   ├── privacy.py        # 隐私过滤
+│   │   ├── graphiti_factory.py # Graphiti 实例工厂
+│   │   └── locale.py         # 双语字符串表
 │   ├── agents/
-│   │   └── aoxia/
-│   │       └── schema.py      # Entity type definitions (customize this)
-│   └── adapters/
-│       └── claude_code/
-│           ├── stop_hook.py   # Write hook (session end)
-│           └── prompt_hook.py # Recall hook (each message)
-├── examples/
-│   └── aoxia_demo/
-│       └── test_connection.py
-├── .env.example
+│   │   ├── default/schema.py # 默认实体类型和 Profile
+│   │   └── registry.py       # Agent Profile 注册表
+│   ├── adapters/
+│   │   ├── claude_code/      # Claude Code Hooks (prompt_hook + stop_hook)
+│   │   ├── mcp/server.py     # MCP Server (stdio + HTTP)
+│   │   └── bridge/           # IM Bridge (bridge_read + bridge_write)
+│   └── cli/main.py           # CLI 工具
+├── tests/                    # 69 个单元测试
 └── pyproject.toml
 ```
 
 ---
 
-## Adapting to Your Agent
+## 自定义 Agent
 
-The schema in `memos/agents/aoxia/schema.py` is built for a personal AI assistant context. The pattern is generic — to adapt it:
+1. 定义 Pydantic 实体类型:
 
-1. Copy `memos/agents/aoxia/` → `memos/agents/your_agent/`
-2. Redefine entity types in `schema.py` to match your domain
-3. Update `extraction_instructions` in `extractor.py` to guide the LLM extractor
-4. Set `agent_id` in your hooks to your agent's name
+```python
+from pydantic import BaseModel, Field
 
-Each `agent_id` is an isolated namespace in Neo4j — multiple agents can share the same database without memory leaking between them.
+class ProjectDecision(BaseModel):
+    topic: str = Field(description="决策主题")
+    conclusion: str = Field(description="决策结论")
+    rationale: str = Field(description="决策理由")
+```
 
----
+2. 注册 Profile:
 
-## Roadmap
+```python
+from memocore.agents.registry import register_profile
 
-- [ ] **M2** — Pre-built schemas for coding assistant, research assistant, project manager
-- [ ] **M2** — Real-time streaming write (don't wait until session end)
-- [ ] **M3** — Multi-agent shared memory with controlled cross-agent recall
-- [ ] **M3** — Memory versioning and rollback
-- [ ] **M4** — Web UI for graph inspection and manual memory editing
+register_profile("my-agent", {
+    "extraction_instructions": "提取项目决策和技术选型...",
+    "session_start_queries": ["最近的项目决策", "技术选型"],
+}, entity_types={"ProjectDecision": ProjectDecision})
+```
 
----
+3. 设置环境变量: `MEMOCORE_AGENT_ID=my-agent`
 
-## Acknowledgements
-
-MemOS builds directly on the work of others — these are not just citations, they're the actual foundation:
-
-### [Graphiti](https://github.com/getzep/graphiti) — Zep AI
-The temporal knowledge graph engine at the heart of MemOS. Graphiti handles entity extraction, embedding, graph construction, temporal reasoning, and hybrid search. MemOS wraps it with agent-specific schemas, hook adapters, and the Dream consolidation layer.  
-**If you find MemOS useful, go give Graphiti a star — it's doing the heavy lifting.**
-
-### [Claude Code](https://claude.ai/code) — Anthropic
-The `UserPromptSubmit` and `Stop` hook system that makes seamless, zero-friction integration possible. The Dream consolidation mechanism was directly inspired by Claude Code's internal memory architecture — their async 4-phase consolidation pattern (Orient → Gather → Consolidate → Prune) maps cleanly to how MemOS maintains graph health.
-
-### [Neo4j](https://neo4j.com)
-The graph + vector database. The combination of graph traversal and vector similarity search is what enables hybrid recall — you can't replicate this with a pure vector store. Neo4j's free Desktop edition is all you need to get started.
+每个 `agent_id` 在 Neo4j 中是独立命名空间，多个 Agent 共享同一数据库不会相互干扰。
 
 ---
+
+## 致谢
+
+- **[Graphiti](https://github.com/getzep/graphiti)** (Zep AI) — 时序知识图谱引擎，Memocore 的核心基础设施
+- **[Claude Code](https://claude.ai/code)** (Anthropic) — Hook 系统使无摩擦集成成为可能；Dream 巩固机制受其内部记忆架构启发
+- **[Neo4j](https://neo4j.com)** — 图 + 向量数据库，支撑混合检索
 
 ## License
 
@@ -302,4 +325,4 @@ MIT
 
 ---
 
-*Built by [Frank Shen](https://github.com/Frankshen923) · Part of the Flying Shrimp (飞虾队) AI infrastructure stack.*
+*Built by [Frank Shen](https://github.com/Frankshen923)*

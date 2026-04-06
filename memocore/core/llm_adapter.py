@@ -1,39 +1,102 @@
 """
-LLM Adapter — 统一的 LLM 调用层
-支持 Claude (Anthropic) 和 OpenAI，自动检测可用 provider
+Memocore LLM Adapter — unified LLM call layer.
+Supports Claude (Anthropic) and OpenAI with automatic provider detection.
 
-Provider 选择逻辑：
-  1. 读取环境变量 MEMOCORE_LLM_PROVIDER = "anthropic" | "openai"
-  2. 若未设置，优先用 Anthropic（如果 ANTHROPIC_API_KEY 存在），否则用 OpenAI
-  3. 若目标 provider 的 API key 缺失，自动 fallback 到另一个
+Provider selection:
+  1. MEMOCORE_LLM_PROVIDER env var = "anthropic" | "openai"
+  2. If unset, prefer Anthropic (if ANTHROPIC_API_KEY exists), else OpenAI
+  3. If target provider's API key is missing, auto-fallback to the other
 
-主要功能：
-  - chat_complete()   : 通用对话补全（返回字符串）
-  - rerank()          : 记忆重排序（返回精筛后的候选列表）
+Main functions:
+  - chat_complete()   : general chat completion (returns string)
+  - rerank()          : memory reranking (returns refined candidate list)
 """
 
 import json
 import logging
 import os
 import re
+import threading
 from typing import Any, Optional
 
 logger = logging.getLogger("memocore.llm_adapter")
 
+# ── LLM client singletons (avoid creating new HTTP connection per call) ────────
+
+_anthropic_client = None
+_openai_client = None
+_client_lock = threading.Lock()
+
+
+def _get_anthropic_client():
+    global _anthropic_client
+    if _anthropic_client is None:
+        with _client_lock:
+            if _anthropic_client is None:
+                import anthropic
+                api_key = os.getenv("ANTHROPIC_API_KEY")
+                if not api_key:
+                    raise RuntimeError("ANTHROPIC_API_KEY is not set")
+                _anthropic_client = anthropic.AsyncAnthropic(api_key=api_key)
+    return _anthropic_client
+
+
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        with _client_lock:
+            if _openai_client is None:
+                import openai
+                api_key = os.getenv("OPENAI_API_KEY")
+                if not api_key:
+                    raise RuntimeError("OPENAI_API_KEY is not set")
+                _openai_client = openai.AsyncOpenAI(api_key=api_key)
+    return _openai_client
+
+
+# ── JSON parsing utility (fault-tolerant LLM output handling) ──────────────────
+
+def parse_llm_json(content: str) -> Any:
+    """
+    Extract JSON from LLM output, automatically strip markdown fences and prose preamble.
+    Raises json.JSONDecodeError if no valid JSON found.
+    """
+    content = content.strip()
+    # try direct parse
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+    # strip markdown fence
+    cleaned = re.sub(r'^```(?:json)?\s*\n?', '', content, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\n?\s*```\s*$', '', cleaned).strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    # extract first JSON object or array
+    match = re.search(r'(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|\[[\s\S]*?\])', content)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+    raise json.JSONDecodeError("No JSON found in LLM output", content, 0)
+
 
 def _detect_provider() -> str:
-    """自动检测可用的 LLM provider"""
+    """Auto-detect available LLM provider"""
     explicit = os.getenv("MEMOCORE_LLM_PROVIDER", "").lower()
     if explicit in ("anthropic", "openai"):
         return explicit
 
-    # 自动检测：优先 Anthropic
+    # auto-detect: prefer Anthropic
     if os.getenv("ANTHROPIC_API_KEY"):
         return "anthropic"
     if os.getenv("OPENAI_API_KEY"):
         return "openai"
 
-    # 兜底：返回 anthropic（调用时再报错）
+    # fallback: return anthropic (error reported at call time)
     return "anthropic"
 
 
@@ -46,19 +109,19 @@ async def chat_complete(
     provider: Optional[str] = None,
 ) -> str:
     """
-    通用 LLM 对话补全
+    General LLM chat completion
 
     Args:
-        prompt: 用户消息
-        system: 系统提示（可选）
-        max_tokens: 最大输出 token 数
-        temperature: 温度
-        json_mode: True 时强制输出 JSON（仅 OpenAI 支持 json_object 模式，
-                   Anthropic 通过 prompt 引导）
-        provider: 强制指定 provider，None 则自动检测
+        prompt: user message
+        system: system prompt (optional)
+        max_tokens: max output tokens
+        temperature: temperature
+        json_mode: when True, force JSON output (only OpenAI supports json_object mode;
+                   Anthropic is guided via prompt)
+        provider: force a specific provider; None means auto-detect
 
     Returns:
-        LLM 返回的文本内容
+        Text content returned by the LLM
     """
     p = provider or _detect_provider()
 
@@ -68,16 +131,16 @@ async def chat_complete(
         else:
             return await _openai_complete(prompt, system, max_tokens, temperature, json_mode)
     except Exception as e:
-        # provider 失败时尝试 fallback
+        # try fallback when provider fails
         fallback = "openai" if p == "anthropic" else "anthropic"
-        logger.warning(f"[llm_adapter] {p} 调用失败: {e}，尝试 fallback 到 {fallback}")
+        logger.warning(f"[llm_adapter] {p} call failed: {e}, falling back to {fallback}")
         try:
             if fallback == "anthropic":
                 return await _anthropic_complete(prompt, system, max_tokens, temperature, json_mode)
             else:
                 return await _openai_complete(prompt, system, max_tokens, temperature, json_mode)
         except Exception as e2:
-            raise RuntimeError(f"LLM 调用失败（{p} 和 {fallback} 均不可用）: {e} | {e2}")
+            raise RuntimeError(f"LLM call failed (both {p} and {fallback} unavailable): {e} | {e2}") from e2
 
 
 async def rerank(
@@ -88,17 +151,17 @@ async def rerank(
     provider: Optional[str] = None,
 ) -> list[Any]:
     """
-    用 LLM 对候选记忆精筛排序
+    Use LLM to rerank candidate memories
 
     Args:
-        query: 当前查询上下文
-        candidates: 候选结果列表
-        top_k: 精筛后保留数量
-        fact_extractor: 从候选对象提取文本的函数，默认用 getattr(r, 'fact', str(r))
-        provider: 强制指定 provider
+        query: current query context
+        candidates: list of candidate results
+        top_k: number of results to keep after reranking
+        fact_extractor: function to extract text from a candidate object; defaults to getattr(r, 'fact', str(r))
+        provider: force a specific provider
 
     Returns:
-        精筛后的候选列表（最多 top_k 条）
+        Reranked candidate list (at most top_k entries)
     """
     if len(candidates) <= top_k:
         return candidates
@@ -112,13 +175,13 @@ async def rerank(
         items.append(f"{i}: {fact_extractor(r)}")
     candidates_text = "\n".join(items)
 
-    prompt = (
-        f"你是记忆召回助手。用户当前的问题/上下文是：\n\n"
-        f"\"{query}\"\n\n"
-        f"以下是从知识图谱召回的候选记忆（共{len(candidates)}条）：\n\n"
-        f"{candidates_text}\n\n"
-        f"请从中选出最相关的 {top_k} 条，按相关性从高到低排序。\n"
-        f"仅返回 JSON 数组，包含选中条目的索引号，例如：[3, 0, 7, 1, 5]"
+    from memocore.core.locale import t
+    prompt = t(
+        "retriever.rerank_prompt",
+        query=query,
+        count=len(candidates),
+        candidates_text=candidates_text,
+        top_k=top_k,
     )
 
     try:
@@ -139,12 +202,12 @@ async def rerank(
             if selected:
                 return selected
     except Exception as e:
-        logger.warning(f"[llm_adapter] rerank 失败，fallback 到截断: {e}")
+        logger.warning(f"[llm_adapter] rerank failed, falling back to truncation: {e}")
 
     return candidates[:top_k]
 
 
-# ── 内部实现 ────────────────────────────────────────────────────────────────────
+# ── internal implementation ─────────────────────────────────────────────────────
 
 async def _anthropic_complete(
     prompt: str,
@@ -153,18 +216,12 @@ async def _anthropic_complete(
     temperature: float,
     json_mode: bool,
 ) -> str:
-    import anthropic
+    client = _get_anthropic_client()
 
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY 未设置")
-
-    client = anthropic.AsyncAnthropic(api_key=api_key)
-
-    # Anthropic 没有原生 json_mode，通过 prompt 引导
+    # Anthropic has no native json_mode; guide via prompt suffix
     effective_prompt = prompt
     if json_mode and "JSON" not in prompt.upper():
-        effective_prompt = prompt + "\n\n请仅返回合法的 JSON，不要包含其他文字。"
+        effective_prompt = prompt + "\n\nReturn only valid JSON. Do not include any other text."
 
     kwargs: dict = dict(
         model=os.getenv("MEMOCORE_ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
@@ -186,13 +243,7 @@ async def _openai_complete(
     temperature: float,
     json_mode: bool,
 ) -> str:
-    import openai
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY 未设置")
-
-    client = openai.AsyncOpenAI(api_key=api_key)
+    client = _get_openai_client()
     messages = []
     if system:
         messages.append({"role": "system", "content": system})

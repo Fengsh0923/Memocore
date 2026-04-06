@@ -1,21 +1,17 @@
 """
-Graphiti 工厂模块 — 注入可配置的 LLM Client 和 Embedder
+Memocore Graphiti Factory — inject configurable LLM Client and Embedder.
 
-解决的问题：
-  Graphiti 默认全部走 OpenAI（LLM + Embedding），没有 OpenAI key 时系统完全不可用。
+LLM Provider (MEMOCORE_LLM_PROVIDER):
+  anthropic  — graphiti built-in AnthropicClient (requires ANTHROPIC_API_KEY)
+  openai     — graphiti built-in OpenAIClient (requires OPENAI_API_KEY)
+  auto       — prefer Anthropic, fallback to OpenAI (default)
 
-支持的组合：
-  LLM Provider (MEMOCORE_LLM_PROVIDER):
-    anthropic  — 使用 graphiti 内置 AnthropicClient（需要 ANTHROPIC_API_KEY）
-    openai     — 使用 graphiti 内置 OpenAIClient（需要 OPENAI_API_KEY）
-    auto       — 优先 Anthropic，fallback OpenAI（默认）
+Embed Provider (MEMOCORE_EMBED_PROVIDER):
+  openai     — OpenAIEmbedder (default, requires OPENAI_API_KEY)
+  local      — local embedding (fastembed or sentence-transformers, no API key)
+  auto       — use openai if OPENAI_API_KEY is set, otherwise local
 
-  Embed Provider (MEMOCORE_EMBED_PROVIDER):
-    openai     — OpenAIEmbedder（默认，需要 OPENAI_API_KEY）
-    local      — 本地 embedding（fastembed 或 sentence-transformers，无需 API key）
-    auto       — 有 OPENAI_API_KEY 用 openai，否则 local
-
-用法：
+Usage:
     from memocore.core.graphiti_factory import build_graphiti
     graphiti = await build_graphiti(uri=..., user=..., password=...)
 """
@@ -23,6 +19,8 @@ Graphiti 工厂模块 — 注入可配置的 LLM Client 和 Embedder
 import logging
 import os
 from typing import Optional
+
+from memocore.core.config import get_neo4j_config
 
 logger = logging.getLogger("memocore.graphiti_factory")
 
@@ -43,8 +41,8 @@ def _embed_provider() -> str:
 
 def _build_llm_client():
     """
-    根据 MEMOCORE_LLM_PROVIDER 返回 Graphiti 用的 LLMClient 实例。
-    Graphiti 原生支持 AnthropicClient 和 OpenAIClient。
+    Return LLMClient instance for Graphiti based on MEMOCORE_LLM_PROVIDER.
+    Graphiti natively supports AnthropicClient and OpenAIClient.
     """
     provider = _llm_provider()
 
@@ -54,12 +52,12 @@ def _build_llm_client():
             from graphiti_core.llm_client.config import LLMConfig
             api_key = os.getenv("ANTHROPIC_API_KEY")
             if not api_key:
-                raise RuntimeError("MEMOCORE_LLM_PROVIDER=anthropic 但 ANTHROPIC_API_KEY 未设置")
+                raise RuntimeError("MEMOCORE_LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY is not set")
             model = os.getenv("MEMOCORE_ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
             logger.info(f"[graphiti_factory] LLM client: AnthropicClient model={model}")
             return AnthropicClient(config=LLMConfig(api_key=api_key, model=model))
         except ImportError:
-            logger.warning("[graphiti_factory] AnthropicClient 不可用，fallback 到 OpenAI")
+            logger.warning("[graphiti_factory] AnthropicClient unavailable, falling back to OpenAI")
 
     # OpenAI (default)
     try:
@@ -67,23 +65,23 @@ def _build_llm_client():
         from graphiti_core.llm_client.config import LLMConfig
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            raise RuntimeError("OPENAI_API_KEY 未设置，且无可用的 LLM provider")
+            raise RuntimeError("OPENAI_API_KEY is not set and no LLM provider is available")
         model = os.getenv("MEMOCORE_OPENAI_MODEL", "gpt-4o-mini")
         logger.info(f"[graphiti_factory] LLM client: OpenAIClient model={model}")
         return OpenAIClient(config=LLMConfig(api_key=api_key, model=model))
     except ImportError as e:
-        raise RuntimeError(f"无法初始化 LLM client: {e}")
+        raise RuntimeError(f"Cannot initialize LLM client: {e}")
 
 
 def _build_embedder():
     """
-    根据 MEMOCORE_EMBED_PROVIDER 返回 Graphiti 用的 EmbedderClient 实例。
+    Return EmbedderClient instance for Graphiti based on MEMOCORE_EMBED_PROVIDER.
     """
     provider = _embed_provider()
 
     if provider == "local":
         from memocore.core.embedder import LocalEmbedder
-        logger.info("[graphiti_factory] Embedder: LocalEmbedder（本地推理，无需 API key）")
+        logger.info("[graphiti_factory] Embedder: LocalEmbedder (local inference, no API key needed)")
         return LocalEmbedder()
 
     # OpenAI (default)
@@ -91,14 +89,14 @@ def _build_embedder():
         from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            logger.warning("[graphiti_factory] OPENAI_API_KEY 未设置，自动切换到本地 Embedder")
+            logger.warning("[graphiti_factory] OPENAI_API_KEY not set, switching to local Embedder")
             from memocore.core.embedder import LocalEmbedder
             return LocalEmbedder()
         model = os.getenv("MEMOCORE_EMBED_MODEL", "text-embedding-3-small")
         logger.info(f"[graphiti_factory] Embedder: OpenAIEmbedder model={model}")
         return OpenAIEmbedder(config=OpenAIEmbedderConfig(api_key=api_key, embedding_model=model))
     except ImportError:
-        logger.warning("[graphiti_factory] OpenAIEmbedder 不可用，fallback 到本地 Embedder")
+        logger.warning("[graphiti_factory] OpenAIEmbedder unavailable, falling back to local Embedder")
         from memocore.core.embedder import LocalEmbedder
         return LocalEmbedder()
 
@@ -110,20 +108,21 @@ async def build_graphiti(
     build_indices: bool = False,
 ) -> "Graphiti":
     """
-    创建注入了可配置 LLM client 和 Embedder 的 Graphiti 实例
+    Create a Graphiti instance with configurable LLM client and Embedder.
 
     Args:
-        uri, user, password: Neo4j 连接参数（None 时从环境变量读取）
-        build_indices: True 时调用 build_indices_and_constraints()（首次初始化时用）
+        uri, user, password: Neo4j connection params (reads from config if None)
+        build_indices: if True, call build_indices_and_constraints() (first init)
 
     Returns:
-        配置好的 Graphiti 实例
+        Configured Graphiti instance
     """
     from graphiti_core import Graphiti
 
-    neo4j_uri = uri or os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    neo4j_user = user or os.getenv("NEO4J_USER", "neo4j")
-    neo4j_password = password or os.getenv("NEO4J_PASSWORD", "")
+    cfg = get_neo4j_config()
+    neo4j_uri = uri or cfg["uri"]
+    neo4j_user = user or cfg["user"]
+    neo4j_password = password or cfg["password"]
 
     llm_client = _build_llm_client()
     embedder = _build_embedder()

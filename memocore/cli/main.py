@@ -1,20 +1,20 @@
 """
-memocore CLI — 记忆管理命令行工具
+memocore CLI — memory management command-line tool
 
-命令：
-  memocore init                         交互式初始化配置（API key、Neo4j 等）
-  memocore list   [--agent ID] [-n N]   列出最近记忆
-  memocore search QUERY [--agent ID]    语义搜索记忆
-  memocore delete UUID [--force]        删除指定节点
-  memocore stats  [--agent ID]          图谱统计
-  memocore export [--agent ID] [--format json|md] [-o FILE]  导出记忆
-  memocore import FILE [--agent ID]     导入记忆
-  memocore privacy-scan TEXT            预览隐私过滤结果
+Commands:
+  memocore init                         Interactive configuration setup (API key, Neo4j, etc.)
+  memocore list   [--agent ID] [-n N]   List recent memories
+  memocore search QUERY [--agent ID]    Semantic memory search
+  memocore delete UUID [--force]        Delete a specific node
+  memocore stats  [--agent ID]          Graph statistics
+  memocore export [--agent ID] [--format json|md] [-o FILE]  Export memories
+  memocore import FILE [--agent ID]     Import memories
+  memocore privacy-scan TEXT            Preview privacy filtering results
 
-用法示例：
+Usage examples:
   memocore init
   memocore list -n 20
-  memocore search "飞书通知规则"
+  memocore search "notification rules"
   memocore export --format md -o memories.md
   memocore import backup.json
 """
@@ -26,20 +26,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# 确保 memocore 可 import
-_project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(_project_root))
-
 try:
     import click
 except ImportError:
-    print("CLI 依赖未安装，请运行：pip install click", file=sys.stderr)
+    print("CLI dependencies not installed, please run: pip install click", file=sys.stderr)
     sys.exit(1)
-
-from dotenv import load_dotenv
-_env = _project_root / ".env"
-if _env.exists():
-    load_dotenv(_env)
 
 from memocore.core.config import (
     get_agent_id, get_global_config_path, get_state_dir,
@@ -47,7 +38,7 @@ from memocore.core.config import (
 )
 
 
-# ── 辅助函数 ────────────────────────────────────────────────────────────────────
+# ── Helper functions ────────────────────────────────────────────────────────────────────
 
 def _run(coro):
     return asyncio.run(coro)
@@ -59,12 +50,12 @@ async def _get_neo4j_driver():
     return AsyncGraphDatabase.driver(cfg["uri"], auth=(cfg["user"], cfg["password"]))
 
 
-# ── CLI 主组 ────────────────────────────────────────────────────────────────────
+# ── CLI main group ────────────────────────────────────────────────────────────────────
 
 @click.group()
-@click.version_option("0.1.0", prog_name="memocore")
+@click.version_option("1.0.0", prog_name="memocore")
 def cli():
-    """Memocore — AI Agent 持久化记忆管理工具"""
+    """Memocore — AI Agent persistent memory management tool"""
     pass
 
 
@@ -72,19 +63,19 @@ def cli():
 
 @cli.command()
 def init():
-    """交互式初始化 Memocore 配置（写入 ~/.memocore/config.env）"""
-    click.echo("\nMemocore 初始化向导")
+    """Interactive Memocore configuration setup (writes to ~/.memocore/config.env)"""
+    click.echo("\nMemocore Setup Wizard")
     click.echo("=" * 40)
-    click.echo(f"配置文件将写入: {get_global_config_path()}\n")
+    click.echo(f"Config file will be written to: {get_global_config_path()}\n")
 
     values = {}
 
     # Agent ID
-    agent_id = click.prompt("Agent ID（你的命名空间）", default=get_agent_id())
+    agent_id = click.prompt("Agent ID (your namespace)", default=get_agent_id())
     values["MEMOCORE_AGENT_ID"] = agent_id
 
     # LLM Provider
-    click.echo("\n--- LLM 配置 ---")
+    click.echo("\n--- LLM Configuration ---")
     provider = click.prompt(
         "LLM Provider",
         type=click.Choice(["anthropic", "openai", "auto"], case_sensitive=False),
@@ -93,66 +84,66 @@ def init():
     values["MEMOCORE_LLM_PROVIDER"] = provider
 
     if provider in ("anthropic", "auto"):
-        key = click.prompt("Anthropic API Key（留空跳过）", default="", hide_input=True)
+        key = click.prompt("Anthropic API Key (leave blank to skip)", default="", hide_input=True)
         if key:
             values["ANTHROPIC_API_KEY"] = key
 
     if provider in ("openai", "auto"):
-        key = click.prompt("OpenAI API Key（留空跳过）", default="", hide_input=True)
+        key = click.prompt("OpenAI API Key (leave blank to skip)", default="", hide_input=True)
         if key:
             values["OPENAI_API_KEY"] = key
 
     # Embedding
-    click.echo("\n--- Embedding 配置 ---")
+    click.echo("\n--- Embedding Configuration ---")
     embed = click.prompt(
-        "Embedding Provider（local 无需 API key）",
+        "Embedding Provider (local requires no API key)",
         type=click.Choice(["auto", "openai", "local"], case_sensitive=False),
         default="auto",
     )
     values["MEMOCORE_EMBED_PROVIDER"] = embed
 
     # Neo4j
-    click.echo("\n--- Neo4j 配置 ---")
+    click.echo("\n--- Neo4j Configuration ---")
     cfg = get_neo4j_config()
     neo4j_uri = click.prompt("Neo4j URI", default=cfg["uri"])
-    neo4j_user = click.prompt("Neo4j 用户名", default=cfg["user"])
-    neo4j_password = click.prompt("Neo4j 密码", default=cfg["password"], hide_input=True)
+    neo4j_user = click.prompt("Neo4j username", default=cfg["user"])
+    neo4j_password = click.prompt("Neo4j password", default=cfg["password"], hide_input=True)
     values["NEO4J_URI"] = neo4j_uri
     values["NEO4J_USER"] = neo4j_user
     values["NEO4J_PASSWORD"] = neo4j_password
 
-    # 高级配置
-    click.echo("\n--- 高级配置（回车使用默认值）---")
-    dream_interval = click.prompt("Dream 触发间隔（会话次数）", default="5")
+    # Advanced configuration
+    click.echo("\n--- Advanced Configuration (press Enter to use defaults) ---")
+    dream_interval = click.prompt("Dream trigger interval (number of sessions)", default="5")
     values["MEMOCORE_DREAM_INTERVAL"] = dream_interval
 
-    ttl_days = click.prompt("记忆 TTL（天，超期且低置信度节点将被清理）", default="90")
+    ttl_days = click.prompt("Memory TTL (days; expired low-confidence nodes will be pruned)", default="90")
     values["MEMOCORE_DREAM_TTL_DAYS"] = ttl_days
 
-    privacy = click.confirm("启用隐私过滤（自动 redact API key 等敏感信息）", default=True)
+    privacy = click.confirm("Enable privacy filtering (auto-redact API keys and other sensitive info)", default=True)
     values["MEMOCORE_PRIVACY_ENABLED"] = "true" if privacy else "false"
 
-    # 写入
+    # Write config
     config_path = write_global_config(values)
-    click.echo(f"\n配置已写入: {config_path}")
-    click.echo("\n使用 `memocore stats` 验证连接。")
+    click.echo(f"\nConfig written to: {config_path}")
+    click.echo("\nRun `memocore stats` to verify the connection.")
 
 
 # ── list ────────────────────────────────────────────────────────────────────────
 
 @cli.command(name="list")
-@click.option("--agent", default=None, help="Agent ID（默认读取 MEMOCORE_AGENT_ID）")
-@click.option("-n", "--limit", default=20, show_default=True, help="返回条数")
-@click.option("--type", "entity_type", default=None, help="实体类型过滤（如 Judgment）")
+@click.option("--agent", default=None, help="Agent ID (defaults to MEMOCORE_AGENT_ID)")
+@click.option("-n", "--limit", default=20, show_default=True, help="Number of results to return")
+@click.option("--type", "entity_type", default=None, help="Filter by entity type (e.g. Judgment)")
 def list_memories(agent, limit, entity_type):
-    """列出最近写入的记忆节点"""
+    """List recently written memory nodes"""
     agent_id = agent or get_agent_id()
 
     async def _run_list():
         driver = await _get_neo4j_driver()
         try:
             async with driver.session() as session:
-                type_filter = f"AND n.entity_type = '{entity_type}'" if entity_type else ""
+                type_filter = "AND n.entity_type = $etype" if entity_type else ""
                 q = f"""
                 MATCH (n {{group_id: $gid}})
                 WHERE n.name IS NOT NULL {type_filter}
@@ -165,7 +156,10 @@ def list_memories(agent, limit, entity_type):
                 ORDER BY n.created_at DESC
                 LIMIT $limit
                 """
-                result = await session.run(q, gid=agent_id, limit=limit)
+                params = {"gid": agent_id, "limit": limit}
+                if entity_type:
+                    params["etype"] = entity_type
+                result = await session.run(q, **params)
                 records = await result.data()
                 return records
         finally:
@@ -174,10 +168,10 @@ def list_memories(agent, limit, entity_type):
     records = _run(_run_list())
 
     if not records:
-        click.echo(f"[{agent_id}] 暂无记忆（图谱为空或 agent_id 不匹配）")
+        click.echo(f"[{agent_id}] No memories found (graph is empty or agent_id does not match)")
         return
 
-    click.echo(f"\n[{agent_id}] 最近 {len(records)} 条记忆：\n")
+    click.echo(f"\n[{agent_id}] Most recent {len(records)} memories:\n")
     for r in records:
         conf = f"{r['confidence']:.1f}" if r.get('confidence') else "—"
         status = r.get('status') or 'confirmed'
@@ -192,10 +186,10 @@ def list_memories(agent, limit, entity_type):
 @cli.command()
 @click.argument("query")
 @click.option("--agent", default=None, help="Agent ID")
-@click.option("-k", "--top-k", default=10, show_default=True, help="返回条数")
-@click.option("--no-rerank", is_flag=True, help="跳过 LLM rerank（更快）")
+@click.option("-k", "--top-k", default=10, show_default=True, help="Number of results to return")
+@click.option("--no-rerank", is_flag=True, help="Skip LLM rerank (faster)")
 def search(query, agent, top_k, no_rerank):
-    """语义搜索记忆图谱"""
+    """Semantic search of the memory graph"""
     agent_id = agent or get_agent_id()
 
     async def _run_search():
@@ -216,17 +210,17 @@ def search(query, agent, top_k, no_rerank):
     if result and result.strip():
         click.echo(result)
     else:
-        click.echo(f"未找到与「{query}」相关的记忆")
+        click.echo(f"No memories found related to \"{query}\"")
 
 
 # ── delete ──────────────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.argument("uuid")
-@click.option("--force", is_flag=True, help="跳过确认直接删除")
-@click.option("--agent", default=None, help="Agent ID（用于验证所属）")
+@click.option("--force", is_flag=True, help="Delete without confirmation prompt")
+@click.option("--agent", default=None, help="Agent ID (used to verify ownership)")
 def delete(uuid, force, agent):
-    """删除指定 UUID 的记忆节点"""
+    """Delete the memory node with the specified UUID"""
     agent_id = agent or get_agent_id()
 
     async def _preview():
@@ -243,14 +237,14 @@ def delete(uuid, force, agent):
 
     rec = _run(_preview())
     if not rec:
-        click.echo(f"未找到节点 {uuid}（可能已删除，或 agent_id 不匹配）")
+        click.echo(f"Node {uuid} not found (may already be deleted, or agent_id does not match)")
         return
 
-    click.echo(f"目标节点: [{rec['type']}] {rec['name']} ({uuid})")
+    click.echo(f"Target node: [{rec['type']}] {rec['name']} ({uuid})")
 
     if not force:
-        if not click.confirm("确认删除？此操作不可恢复", default=False):
-            click.echo("已取消")
+        if not click.confirm("Confirm deletion? This action cannot be undone", default=False):
+            click.echo("Cancelled")
             return
 
     async def _do_delete():
@@ -265,15 +259,15 @@ def delete(uuid, force, agent):
             await driver.close()
 
     _run(_do_delete())
-    click.echo(f"已删除: {uuid}")
+    click.echo(f"Deleted: {uuid}")
 
 
 # ── stats ────────────────────────────────────────────────────────────────────────
 
 @cli.command()
-@click.option("--agent", default=None, help="Agent ID（None 则显示全部）")
+@click.option("--agent", default=None, help="Agent ID (None shows all)")
 def stats(agent):
-    """显示记忆图谱统计信息"""
+    """Display memory graph statistics"""
     agent_id = agent or get_agent_id()
 
     async def _run_stats():
@@ -306,26 +300,26 @@ def stats(agent):
     nodes, edges, types, confs, latest = _run(_run_stats())
     latest_str = str(latest)[:10] if latest else "—"
 
-    click.echo(f"\nMemocore 图谱统计 — agent: {agent_id}")
+    click.echo(f"\nMemocore Graph Statistics — agent: {agent_id}")
     click.echo("=" * 40)
-    click.echo(f"  节点总数:     {nodes}")
-    click.echo(f"  关系总数:     {edges}")
-    click.echo(f"  最近更新:     {latest_str}")
+    click.echo(f"  Total nodes:          {nodes}")
+    click.echo(f"  Total relationships:  {edges}")
+    click.echo(f"  Last updated:         {latest_str}")
 
     if types:
-        click.echo("\n  实体类型分布:")
+        click.echo("\n  Entity type distribution:")
         for t in types:
             click.echo(f"    {t['type']:20s} {t['cnt']:>5}")
 
     if any(r.get('status') for r in confs):
-        click.echo("\n  置信度分布:")
+        click.echo("\n  Confidence distribution:")
         for c in confs:
             s = c.get('status') or 'confirmed'
             click.echo(f"    {s:12s} {c['cnt']:>5}")
 
     config_path = get_global_config_path()
-    click.echo(f"\n  配置文件:     {config_path}")
-    click.echo(f"  状态目录:     {get_state_dir()}")
+    click.echo(f"\n  Config file:   {config_path}")
+    click.echo(f"  State dir:     {get_state_dir()}")
 
 
 # ── export ───────────────────────────────────────────────────────────────────────
@@ -333,17 +327,17 @@ def stats(agent):
 @cli.command(name="export")
 @click.option("--agent", default=None, help="Agent ID")
 @click.option("--format", "fmt", type=click.Choice(["json", "md"]), default="json", show_default=True)
-@click.option("-o", "--output", default=None, help="输出文件路径（默认 stdout）")
-@click.option("--limit", default=1000, show_default=True, help="最大导出节点数")
+@click.option("-o", "--output", default=None, help="Output file path (defaults to stdout)")
+@click.option("--limit", default=1000, show_default=True, help="Maximum number of nodes to export")
 def export_memories(agent, fmt, output, limit):
-    """导出记忆为 JSON 或 Markdown 格式"""
+    """Export memories as JSON or Markdown format"""
     agent_id = agent or get_agent_id()
 
     async def _run_export():
         driver = await _get_neo4j_driver()
         try:
             async with driver.session() as session:
-                # 导出节点
+                # Export nodes
                 node_q = """
                 MATCH (n {group_id: $gid})
                 WHERE n.name IS NOT NULL
@@ -356,7 +350,7 @@ def export_memories(agent, fmt, output, limit):
                 """
                 nodes = await (await session.run(node_q, gid=agent_id, limit=limit)).data()
 
-                # 导出 edges
+                # Export edges
                 edge_q = """
                 MATCH (a {group_id: $gid})-[e]->(b {group_id: $gid})
                 WHERE e.fact IS NOT NULL
@@ -383,17 +377,17 @@ def export_memories(agent, fmt, output, limit):
         }
         content = json.dumps(data, ensure_ascii=False, indent=2, default=str)
     else:
-        # Markdown 格式
+        # Markdown format
         lines = [
-            f"# Memocore 记忆导出",
+            f"# Memocore Memory Export",
             f"",
             f"- **Agent**: {agent_id}",
-            f"- **导出时间**: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            f"- **节点数**: {len(nodes)}  **关系数**: {len(edges)}",
+            f"- **Export time**: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            f"- **Nodes**: {len(nodes)}  **Relationships**: {len(edges)}",
             f"",
             f"---",
             f"",
-            f"## 记忆节点",
+            f"## Memory Nodes",
             f"",
         ]
         for n in nodes:
@@ -406,7 +400,7 @@ def export_memories(agent, fmt, output, limit):
             lines.append(f"")
 
         if edges:
-            lines += ["---", "", "## 关系（Facts）", ""]
+            lines += ["---", "", "## Relationships (Facts)", ""]
             for e in edges:
                 lines.append(f"- **{e['src']}** → **{e['tgt']}**: {e['fact']}")
 
@@ -414,7 +408,7 @@ def export_memories(agent, fmt, output, limit):
 
     if output:
         Path(output).write_text(content, encoding="utf-8")
-        click.echo(f"已导出 {len(nodes)} 节点 + {len(edges)} 关系 到 {output}")
+        click.echo(f"Exported {len(nodes)} nodes + {len(edges)} relationships to {output}")
     else:
         click.echo(content)
 
@@ -423,16 +417,16 @@ def export_memories(agent, fmt, output, limit):
 
 @cli.command(name="import")
 @click.argument("file", type=click.Path(exists=True))
-@click.option("--agent", default=None, help="导入到的 Agent ID（默认用文件内的 agent_id）")
-@click.option("--dry-run", is_flag=True, help="只预览，不写入")
+@click.option("--agent", default=None, help="Target Agent ID (defaults to agent_id from file)")
+@click.option("--dry-run", is_flag=True, help="Preview only, do not write")
 def import_memories(file, agent, dry_run):
-    """从 JSON 导出文件恢复记忆"""
+    """Restore memories from JSON export file"""
     content = Path(file).read_text(encoding="utf-8")
     try:
         data = json.loads(content)
         export_data = data.get("memocore_export", data)
     except json.JSONDecodeError as e:
-        click.echo(f"无效的 JSON 文件: {e}", err=True)
+        click.echo(f"Invalid JSON file: {e}", err=True)
         sys.exit(1)
 
     source_agent = export_data.get("agent_id", "unknown")
@@ -440,23 +434,25 @@ def import_memories(file, agent, dry_run):
     nodes = export_data.get("nodes", [])
     edges = export_data.get("edges", [])
 
-    click.echo(f"导入来源: agent={source_agent} | 节点={len(nodes)} 关系={len(edges)}")
-    click.echo(f"导入目标: agent={target_agent}")
+    click.echo(f"Import source: agent={source_agent} | nodes={len(nodes)} relationships={len(edges)}")
+    click.echo(f"Import target: agent={target_agent}")
 
     if dry_run:
-        click.echo("[dry-run] 不执行实际写入")
+        click.echo("[dry-run] No actual writes performed")
         return
 
-    if not click.confirm(f"确认导入 {len(nodes)} 个节点到 [{target_agent}]？", default=True):
-        click.echo("已取消")
+    if not click.confirm(f"Confirm import of {len(nodes)} nodes to [{target_agent}]?", default=True):
+        click.echo("Cancelled")
         return
 
     async def _do_import():
         driver = await _get_neo4j_driver()
-        imported = 0
+        imported_nodes = 0
+        imported_edges = 0
         skipped = 0
         try:
             async with driver.session() as session:
+                # Import nodes
                 for n in nodes:
                     if not n.get("uuid") or not n.get("name"):
                         skipped += 1
@@ -480,34 +476,57 @@ def import_memories(file, agent, dry_run):
                         confidence=n.get("confidence", 1.0),
                         status=n.get("status", "confirmed"),
                     )
-                    imported += 1
+                    imported_nodes += 1
+
+                # Import edges (matched by src/tgt name against existing nodes)
+                for e in edges:
+                    if not e.get("src") or not e.get("tgt") or not e.get("fact"):
+                        skipped += 1
+                        continue
+                    eq = """
+                    MATCH (a {group_id: $gid, name: $src})
+                    MATCH (b {group_id: $gid, name: $tgt})
+                    WITH a, b LIMIT 1
+                    MERGE (a)-[r:RELATES_TO {uuid: $uuid}]->(b)
+                    SET r.fact = $fact,
+                        r.group_id = $gid,
+                        r.created_at = $created_at
+                    """
+                    await session.run(eq,
+                        gid=target_agent,
+                        src=e["src"], tgt=e["tgt"],
+                        uuid=e.get("uuid", ""),
+                        fact=e["fact"],
+                        created_at=e.get("created_at", ""),
+                    )
+                    imported_edges += 1
         finally:
             await driver.close()
-        return imported, skipped
+        return imported_nodes, imported_edges, skipped
 
-    imported, skipped = _run(_do_import())
-    click.echo(f"导入完成: 成功 {imported} 个，跳过 {skipped} 个")
+    imported_nodes, imported_edges, skipped = _run(_do_import())
+    click.echo(f"Import complete: {imported_nodes} nodes, {imported_edges} relationships, {skipped} skipped")
 
 
 # ── browse ───────────────────────────────────────────────────────────────────────
 
 @cli.command()
 @click.option("--agent", default=None, help="Agent ID")
-@click.option("--entity", default=None, help="查看指定实体的编译知识")
-@click.option("--report", is_flag=True, help="显示最新 Lint 健康报告")
+@click.option("--entity", default=None, help="View compiled knowledge for a specific entity")
+@click.option("--report", is_flag=True, help="Show latest Lint health report")
 def browse(agent, entity, report):
-    """浏览编译后的知识页面和 Lint 报告"""
+    """Browse compiled knowledge pages and Lint reports"""
     agent_id = agent or get_agent_id()
 
     if report:
-        # 显示最新的 Lint 报告
-        report_dir = Path.home() / ".memocore" / "reports" / agent_id
+        # Display the latest Lint report
+        report_dir = get_state_dir() / "reports" / agent_id
         if not report_dir.exists():
-            click.echo(f"[{agent_id}] 尚无 Lint 报告（需先运行 Dream）")
+            click.echo(f"[{agent_id}] No Lint report yet (run Dream first)")
             return
         reports = sorted(report_dir.glob("*.md"), reverse=True)
         if not reports:
-            click.echo(f"[{agent_id}] 尚无 Lint 报告")
+            click.echo(f"[{agent_id}] No Lint report yet")
             return
         click.echo(reports[0].read_text(encoding="utf-8"))
         return
@@ -517,7 +536,7 @@ def browse(agent, entity, report):
         try:
             async with driver.session() as session:
                 if entity:
-                    # 查看特定实体的编译页面
+                    # View compiled page for specific entity
                     q = """
                     MATCH (p:CompiledPage {group_id: $gid, title: $title})
                     RETURN p.content AS content, p.confidence AS confidence,
@@ -529,7 +548,7 @@ def browse(agent, entity, report):
                         return "single", rec
                     return "not_found", entity
 
-                # 列出所有编译页面
+                # List all compiled pages
                 q = """
                 MATCH (p:CompiledPage {group_id: $gid})
                 WHERE p.page_type = 'entity'
@@ -541,7 +560,7 @@ def browse(agent, entity, report):
                 r = await session.run(q, gid=agent_id)
                 pages = await r.data()
 
-                # 获取 overview
+                # Get overview
                 ov_q = """
                 MATCH (p:CompiledPage {group_id: $gid, title: '__overview__'})
                 RETURN p.content AS content
@@ -557,8 +576,8 @@ def browse(agent, entity, report):
     mode, data = _run(_browse())
 
     if mode == "not_found":
-        click.echo(f"未找到实体「{data}」的编译知识")
-        click.echo("使用 `memocore browse` 查看所有已编译页面")
+        click.echo(f"No compiled knowledge found for entity \"{data}\"")
+        click.echo("Use `memocore browse` to view all compiled pages")
         return
 
     if mode == "single":
@@ -572,50 +591,50 @@ def browse(agent, entity, report):
     pages, overview = data
 
     if not pages:
-        click.echo(f"[{agent_id}] 尚无编译知识（需先运行 Dream）")
-        click.echo("  运行: python -m memocore.core.dream --agent-id " + agent_id)
+        click.echo(f"[{agent_id}] No compiled knowledge yet (run Dream first)")
+        click.echo("  Run: python -m memocore.core.dream --agent-id " + agent_id)
         return
 
-    click.echo(f"\nMemocore 编译知识 — agent: {agent_id}")
+    click.echo(f"\nMemocore Compiled Knowledge — agent: {agent_id}")
     click.echo("=" * 50)
 
     if overview:
         click.echo(f"\n{overview}\n")
         click.echo("-" * 50)
 
-    click.echo(f"\n已编译实体页 ({len(pages)}):\n")
+    click.echo(f"\nCompiled entity pages ({len(pages)}):\n")
     for p in pages:
         conf = f"{p['confidence']:.1f}" if p.get('confidence') else "—"
         compiled = str(p.get('compiled_at', ''))[:10]
         click.echo(f"  {p['title']:20s}  conf={conf}  facts={p.get('source_count', 0):>3}  compiled={compiled}")
 
-    click.echo(f"\n查看详情: memocore browse --entity <实体名>")
-    click.echo(f"健康报告: memocore browse --report")
+    click.echo(f"\nView details: memocore browse --entity <entity name>")
+    click.echo(f"Health report: memocore browse --report")
 
 
 # ── privacy-scan ─────────────────────────────────────────────────────────────────
 
 @cli.command(name="privacy-scan")
 @click.argument("text", required=False)
-@click.option("--file", "-f", type=click.Path(exists=True), help="从文件读取文本")
+@click.option("--file", "-f", type=click.Path(exists=True), help="Read text from file")
 def privacy_scan(text, file):
-    """预览隐私过滤效果（不写入任何数据）"""
+    """Preview privacy filtering (no data written)"""
     if file:
         text = Path(file).read_text(encoding="utf-8")
     elif not text:
-        click.echo("请提供文本参数或 --file", err=True)
+        click.echo("Please provide text argument or --file", err=True)
         sys.exit(1)
 
     from memocore.core.privacy import PrivacyFilter
     f = PrivacyFilter()
     cleaned, report = f.process(text)
 
-    click.echo(f"\n过滤报告: {report}")
-    click.echo("\n--- 处理后文本 ---")
+    click.echo(f"\nFilter report: {report}")
+    click.echo("\n--- Processed text ---")
     click.echo(cleaned)
 
 
-# ── 入口 ─────────────────────────────────────────────────────────────────────────
+# ── Entrypoint ─────────────────────────────────────────────────────────────────────────
 
 def main():
     cli()

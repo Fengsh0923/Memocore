@@ -1,30 +1,30 @@
 """
-隐私过滤模块
+Privacy Filtering Module
 
-在记忆写入前自动扫描对话内容，识别并 redact 敏感信息：
+Automatically scans conversation content before memory write, identifies and redacts sensitive information:
 
-内置规则（正则）：
-  - API Keys: OpenAI (sk-...), Anthropic (sk-ant-...), GitHub (ghp_...) 等主流格式
-  - 私钥 / 证书: -----BEGIN ... KEY-----
-  - 密码参数: --password xxx, -p xxx, password=xxx
-  - 数据库连接串: postgresql://user:pass@host
+Built-in rules (regex):
+  - API Keys: OpenAI (sk-...), Anthropic (sk-ant-...), GitHub (ghp_...) and other common formats
+  - Private keys / certificates: -----BEGIN ... KEY-----
+  - Password parameters: --password xxx, -p xxx, password=xxx
+  - Database connection strings: postgresql://user:pass@host
   - Bearer Token: Authorization: Bearer ...
-  - 手机号（中国大陆）: 1[3-9]xxxxxxxxx
-  - 身份证号（中国）: 18 位
+  - Phone numbers (China mainland): 1[3-9]xxxxxxxxx
+  - National ID numbers (China): 18 digits
 
-可配置：
-  MEMOCORE_PRIVACY_ENABLED=false       — 禁用过滤
-  MEMOCORE_PRIVACY_BLACKLIST=word1,w2  — 自定义黑名单短语（命中则整条跳过）
-  MEMOCORE_PRIVACY_LLM_CHECK=true      — 启用 LLM 二次检测（默认 false，增加延迟）
+Configurable:
+  MEMOCORE_PRIVACY_ENABLED=false       — Disable filtering
+  MEMOCORE_PRIVACY_BLACKLIST=word1,w2  — Custom blacklist phrases (skip entire entry if matched)
+  MEMOCORE_PRIVACY_LLM_CHECK=true      — Enable LLM secondary check (default false, adds latency)
 
-使用：
+Usage:
   from memocore.core.privacy import PrivacyFilter
   f = PrivacyFilter()
   clean_text, report = f.process(raw_text)
   if report.should_skip:
-      # 整条对话不写入
+      # Do not write entire conversation
   else:
-      # clean_text 已 redact 敏感字段
+      # clean_text has redacted sensitive fields
 """
 
 import logging
@@ -36,29 +36,29 @@ from memocore.core.config import get_privacy_blacklist, is_privacy_enabled
 
 logger = logging.getLogger("memocore.privacy")
 
-# ── 内置正则规则 ─────────────────────────────────────────────────────────────────
+# ── Built-in regex rules ─────────────────────────────────────────────────────────────────
 
 _REDACT_PATTERNS: list[tuple[str, re.Pattern, str]] = [
+    # Anthropic API key (must be before openai_key, because sk-ant- also matches the sk- prefix)
+    ("anthropic_key", re.compile(r'\bsk-ant-[A-Za-z0-9\-_]{20,}'), "[ANTHROPIC_KEY]"),
     # OpenAI API key
     ("openai_key", re.compile(r'\bsk-[A-Za-z0-9\-_]{20,}'), "[OPENAI_KEY]"),
-    # Anthropic API key
-    ("anthropic_key", re.compile(r'\bsk-ant-[A-Za-z0-9\-_]{20,}'), "[ANTHROPIC_KEY]"),
     # GitHub token
     ("github_token", re.compile(r'\bghp_[A-Za-z0-9]{36,}'), "[GITHUB_TOKEN]"),
     # Generic Bearer token (Authorization header)
     ("bearer_token", re.compile(
         r'(?i)(Authorization:\s*Bearer\s+)[A-Za-z0-9\-._~+/]+=*'
     ), r'\1[BEARER_TOKEN]'),
-    # 私钥 / PEM
+    # Private key / PEM
     ("pem_key", re.compile(
         r'-----BEGIN\s+(?:RSA\s+)?(?:PRIVATE|PUBLIC)\s+KEY-----.*?-----END[^-]*?KEY-----',
         re.DOTALL
     ), "[PEM_KEY]"),
-    # 数据库连接串（含密码）
+    # Database connection string (with password)
     ("db_url", re.compile(
         r'(?i)(postgresql|mysql|mongodb|redis)://[^:@\s]+:[^@\s]+@'
     ), r'\1://[USER]:[PASSWORD]@'),
-    # CLI 密码参数 --password xxx / -p xxx / password=xxx
+    # CLI password parameters --password xxx / -p xxx / password=xxx
     ("cli_password", re.compile(
         r'(?i)(?:--password|-p\s+|password[=\s]+)([^\s\'"]{4,})'
     ), "[PASSWORD]"),
@@ -67,13 +67,13 @@ _REDACT_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     ("aws_secret", re.compile(
         r'(?i)aws[_\-]?secret[_\-]?(?:access[_\-]?)?key[=:\s]+[A-Za-z0-9/+=]{20,}'
     ), "[AWS_SECRET]"),
-    # 中国大陆手机号（严格模式：1[3-9]开头，11位）
+    # China mainland phone number (strict mode: starts with 1[3-9], 11 digits)
     ("cn_phone", re.compile(r'\b1[3-9]\d{9}\b'), "[PHONE]"),
-    # 中国居民身份证（18位）
+    # China national ID (18 digits)
     ("cn_id", re.compile(r'\b\d{17}[\dXx]\b'), "[ID_NUMBER]"),
 ]
 
-# 命中任一规则则整条对话跳过（不 redact，直接放弃写入）
+# Skip entire conversation if any rule matches (no redact, discard write directly)
 _SKIP_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("private_key_block", re.compile(
         r'-----BEGIN\s+(?:ENCRYPTED\s+)?PRIVATE\s+KEY-----'
@@ -98,8 +98,8 @@ class PrivacyReport:
 
 class PrivacyFilter:
     """
-    对话内容隐私过滤器。
-    process() 返回 (cleaned_text, PrivacyReport)。
+    Conversation content privacy filter.
+    process() returns (cleaned_text, PrivacyReport).
     """
 
     def __init__(self):
@@ -109,34 +109,34 @@ class PrivacyFilter:
 
     def process(self, text: str) -> tuple[str, PrivacyReport]:
         """
-        扫描并处理文本中的隐私信息
+        Scan and process privacy information in text
 
         Returns:
             (processed_text, PrivacyReport)
-            若 report.should_skip=True，调用方应跳过整条记忆写入
+            If report.should_skip=True, caller should skip entire memory write
         """
         report = PrivacyReport()
 
         if not self._enabled:
             return text, report
 
-        # 1. 黑名单短语检测（整条跳过）
+        # 1. Blacklist phrase detection (skip entire entry)
         for phrase in self._blacklist:
             if phrase.lower() in text.lower():
                 report.should_skip = True
                 report.skip_reason = f"blacklist hit: '{phrase}'"
-                logger.info(f"[privacy] 跳过: {report.skip_reason}")
+                logger.info(f"[privacy] skip: {report.skip_reason}")
                 return text, report
 
-        # 2. skip 模式检测（含私钥 block 等高危内容，整条跳过）
+        # 2. Skip pattern detection (contains high-risk content like private key blocks, skip entire entry)
         for name, pattern in _SKIP_PATTERNS:
             if pattern.search(text):
                 report.should_skip = True
                 report.skip_reason = f"high-risk pattern: {name}"
-                logger.info(f"[privacy] 跳过: {report.skip_reason}")
+                logger.info(f"[privacy] skip: {report.skip_reason}")
                 return text, report
 
-        # 3. Redact 模式（替换敏感字段）
+        # 3. Redact mode (replace sensitive fields)
         result = text
         for name, pattern, replacement in _REDACT_PATTERNS:
             new_text, count = pattern.subn(replacement, result)
@@ -152,37 +152,30 @@ class PrivacyFilter:
 
     async def process_async(self, text: str) -> tuple[str, PrivacyReport]:
         """
-        异步版本，支持 LLM 二次检测（MEMOCORE_PRIVACY_LLM_CHECK=true 时启用）
+        Async version, supports LLM secondary check (enabled when MEMOCORE_PRIVACY_LLM_CHECK=true)
         """
         text, report = self.process(text)
 
         if report.should_skip or not self._llm_check:
             return text, report
 
-        # LLM 二次检测：对正则未能覆盖的隐私信息做模糊判断
+        # LLM secondary check: fuzzy detection of privacy info not covered by regex
         try:
             from memocore.core.llm_adapter import chat_complete
-            prompt = (
-                "你是隐私审查助手。以下是一段待存储的对话摘要。\n"
-                "请判断其中是否包含以下类型的敏感信息：\n"
-                "  - 密码、密钥、token（未被 [REDACTED] 标记的）\n"
-                "  - 个人身份信息（姓名+地址+身份证的组合）\n"
-                "  - 信用卡号\n\n"
-                f"对话内容：\n{text[:800]}\n\n"
-                "请仅回复：SAFE 或 SENSITIVE（不要解释）"
-            )
+            from memocore.core.locale import t
+            prompt = t("privacy.llm_check_prompt", text=text[:800])
             verdict = await chat_complete(prompt, max_tokens=10, temperature=0.0)
             if "SENSITIVE" in verdict.upper():
                 report.should_skip = True
                 report.skip_reason = "LLM detected sensitive content"
-                logger.info(f"[privacy] LLM 判定为敏感内容，跳过")
+                logger.info(f"[privacy] LLM classified as sensitive content, skipping")
         except Exception as e:
-            logger.warning(f"[privacy] LLM 检测失败（跳过检测步骤）: {e}")
+            logger.warning(f"[privacy] LLM check failed (skipping check step): {e}")
 
         return text, report
 
 
-# ── 便捷函数 ────────────────────────────────────────────────────────────────────
+# ── Convenience functions ────────────────────────────────────────────────────────────────────
 
 _default_filter: PrivacyFilter | None = None
 

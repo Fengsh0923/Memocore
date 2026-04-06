@@ -1,24 +1,22 @@
 """
-MemOS Dream 机制 — 记忆巩固（借鉴 Claude Code Dream 4阶段设计）
+Memocore Dream — memory consolidation
 
-触发时机：Stop hook 完成后，异步后台运行
-四阶段：
-  Phase 1 Orient  — 扫描图谱，找出候选问题区域（重复、矛盾、过期）
-  Phase 2 Gather  — 聚合同类节点的关联 edges
-  Phase 3 Consolidate — LLM 决策：合并 / 更新 / 保留 / 删除
-  Phase 4 Prune   — 执行图谱清理，写入操作日志
+Trigger: runs asynchronously after stop hook completion.
+Phases:
+  Phase 1 Orient      — scan graph, find candidate problem areas (duplicates, conflicts, stale)
+  Phase 2 Gather      — aggregate related edges for candidate nodes
+  Phase 3 Consolidate — LLM decides: merge / update / keep / delete
+  Phase 4 Prune       — execute graph cleanup, write operation log
+  Phase 5 Confidence  — update confidence scores
+  Phase 6 Stale       — mark stale nodes
+  Phase 7 Compile     — compile entity pages (Karpathy LLM Wiki)
 
-设计目标：
-- 保持图谱整洁，避免 Graphiti 里节点爆炸
-- 矛盾事实自动解决（取最新版本）
-- 过期信息降权或删除（> 30 天且未被引用）
-
-用法：
+Usage:
     from memocore.core.dream import run_dream
-    await run_dream(agent_id="aoxia")
+    await run_dream(agent_id="my_agent")
 
-    # 或作为独立脚本运行（供 cron / stop hook 调用）
-    python -m memos.core.dream
+    # Or run as standalone script (for cron / stop hook):
+    python -m memocore.core.dream --agent-id my_agent
 """
 
 import asyncio
@@ -30,30 +28,27 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv
-from memocore.core.llm_adapter import chat_complete
-from memocore.core.config import get_dream_ttl_days
+from memocore.core.llm_adapter import chat_complete, parse_llm_json
+from memocore.core.config import get_dream_ttl_days, get_logs_dir, get_state_dir, cleanup_old_session_flags, get_neo4j_config, validate_agent_id, make_safe_agent_key
+from memocore.core.locale import t
 
-_env_path = Path(__file__).parent.parent.parent / ".env"
-if _env_path.exists():
-    load_dotenv(_env_path)
-
-LOG_FILE = Path.home() / ".private" / "memos_dream.log"
-LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-logging.basicConfig(
-    filename=str(LOG_FILE),
-    level=logging.INFO,
-    format="%(asctime)s [dream] %(levelname)s %(message)s",
-)
-logger = logging.getLogger("memos.dream")
+logger = logging.getLogger("memocore.dream")
 
 
-# ─── 数据结构 ──────────────────────────────────────────────────────────────────
+def _configure_dream_logging():
+    """Configure file logging for dream. Called from CLI entrypoint only."""
+    log_file = get_logs_dir() / "dream.log"
+    handler = logging.FileHandler(str(log_file))
+    handler.setFormatter(logging.Formatter("%(asctime)s [dream] %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+
+# ─── Data structures ─────────────────────────────────────────────────────────
 
 @dataclass
 class DreamReport:
-    """Dream 运行报告"""
+    """Dream run report."""
     agent_id: str
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: Optional[datetime] = None
@@ -71,13 +66,13 @@ class DreamReport:
     pruned: int = 0
     kept: int = 0
 
-    # TTL + 置信度
-    expired: int = 0          # 超过 TTL 被删除的节点
-    confidence_lowered: int = 0  # 置信度被降低的节点
+    # TTL + confidence
+    expired: int = 0
+    confidence_lowered: int = 0
 
     # Phase 7 Compile
-    compiled_pages: int = 0       # 本次编译/更新的 CompiledPage 数
-    skipped_pages: int = 0        # 无新信息跳过的 CompiledPage 数
+    compiled_pages: int = 0
+    skipped_pages: int = 0
 
     # Phase 8 Lint
     lint_contradictions: int = 0
@@ -86,32 +81,31 @@ class DreamReport:
     lint_stale_pages: int = 0
     lint_report_path: Optional[str] = None
 
-    # 状态
-    status: str = "running"   # running / done / failed
+    status: str = "running"
     error: Optional[str] = None
 
     def summary(self) -> str:
         elapsed = ""
         if self.finished_at:
             secs = (self.finished_at - self.started_at).total_seconds()
-            elapsed = f" | 耗时 {secs:.1f}s"
+            elapsed = f" | {secs:.1f}s"
         return (
             f"[Dream {self.agent_id}] {self.status}{elapsed} | "
-            f"节点={self.total_nodes} edges={self.total_edges} | "
-            f"重复={self.duplicate_groups} 矛盾={self.conflict_pairs} "
-            f"过期={self.stale_nodes} 到期删除={self.expired} 降权={self.confidence_lowered} | "
-            f"合并={self.merged} 更新={self.updated} 剪枝={self.pruned} 保留={self.kept} | "
-            f"编译={self.compiled_pages} lint矛盾={self.lint_contradictions} "
-            f"lint孤立={self.lint_orphans} lint缺页={self.lint_missing}"
+            f"nodes={self.total_nodes} edges={self.total_edges} | "
+            f"duplicates={self.duplicate_groups} conflicts={self.conflict_pairs} "
+            f"stale={self.stale_nodes} expired={self.expired} decayed={self.confidence_lowered} | "
+            f"merged={self.merged} updated={self.updated} pruned={self.pruned} kept={self.kept} | "
+            f"compiled={self.compiled_pages} lint_conflicts={self.lint_contradictions} "
+            f"lint_orphans={self.lint_orphans} lint_missing={self.lint_missing}"
         )
 
 
-# ─── Dream 核心类 ──────────────────────────────────────────────────────────────
+# ─── Dream core class ────────────────────────────────────────────────────────
 
 class DreamConsolidator:
     """
-    MemOS Dream 机制主控
-    直接操作 Neo4j（通过 graphiti 封装），不依赖 LLM 的 add_episode 路径
+    Memocore Dream Consolidator
+    Operates directly on Neo4j (via graphiti), independent of LLM add_episode path.
     """
 
     def __init__(
@@ -122,16 +116,17 @@ class DreamConsolidator:
         stale_days: int = 30,
         max_nodes_per_run: int = 200,
     ):
-        self.neo4j_uri = neo4j_uri or os.getenv("NEO4J_URI", "bolt://localhost:7687")
-        self.neo4j_user = neo4j_user or os.getenv("NEO4J_USER", "neo4j")
-        self.neo4j_password = neo4j_password or os.getenv("NEO4J_PASSWORD", "")
+        cfg = get_neo4j_config()
+        self.neo4j_uri = neo4j_uri or cfg["uri"]
+        self.neo4j_user = neo4j_user or cfg["user"]
+        self.neo4j_password = neo4j_password or cfg["password"]
         self.stale_days = stale_days
         self.ttl_days = get_dream_ttl_days()
         self.max_nodes_per_run = max_nodes_per_run
         self._driver = None
 
     async def _get_driver(self):
-        """获取 Neo4j 驱动（lazy init）"""
+        """Get Neo4j driver (lazy init)."""
         if self._driver is None:
             try:
                 from neo4j import AsyncGraphDatabase
@@ -141,7 +136,7 @@ class DreamConsolidator:
                 )
             except ImportError:
                 raise RuntimeError(
-                    "需要安装 neo4j 驱动: pip install neo4j"
+                    "Neo4j driver required: pip install neo4j"
                 )
         return self._driver
 
@@ -154,12 +149,12 @@ class DreamConsolidator:
 
     async def phase1_orient(self, agent_id: str, report: DreamReport) -> dict:
         """
-        扫描图谱，返回三类候选问题：
-        - duplicate_groups: 名称相似的节点组（可能需要合并）
-        - conflict_edges: 同主语/同谓语但结论相反的 edges
-        - stale_nodes: 超过 stale_days 天且 reference_count=0 的节点
+        Scan the graph and return three categories of candidate issues:
+        - duplicate_groups: groups of nodes with similar names (may need merging)
+        - conflict_edges: edges with same subject/predicate but contradictory conclusions
+        - stale_nodes: nodes older than stale_days with reference_count=0
         """
-        logger.info(f"[orient] agent={agent_id} 开始扫描图谱...")
+        logger.info(f"[orient] agent={agent_id} scanning graph...")
         driver = await self._get_driver()
 
         result = {
@@ -169,7 +164,7 @@ class DreamConsolidator:
         }
 
         async with driver.session() as session:
-            # 1a. 统计总量
+            # 1a. count totals
             count_q = """
             MATCH (n {group_id: $gid}) RETURN count(n) as cnt
             """
@@ -185,10 +180,10 @@ class DreamConsolidator:
             report.total_edges = record["cnt"] if record else 0
 
             logger.info(
-                f"[orient] 图谱规模: nodes={report.total_nodes} edges={report.total_edges}"
+                f"[orient] graph size: nodes={report.total_nodes} edges={report.total_edges}"
             )
 
-            # 1b. 找重复节点（同 name 不同 uuid，取最多 50 组）
+            # 1b. find duplicate nodes (same name, different uuid, up to 50 groups)
             dup_q = """
             MATCH (n {group_id: $gid})
             WITH n.name AS name, collect(n.uuid) AS uuids, count(*) AS cnt
@@ -206,10 +201,10 @@ class DreamConsolidator:
                 })
 
             report.duplicate_groups = len(result["duplicate_groups"])
-            logger.info(f"[orient] 重复节点组: {report.duplicate_groups}")
+            logger.info(f"[orient] duplicate node groups: {report.duplicate_groups}")
 
-            # 1c. 找矛盾 edges（同 source+target 但 fact 关键词相反，取最多 30 对）
-            # 策略：找同一对节点之间有多条 RELATES_TO edge 的情况
+            # 1c. find conflicting edges (same source+target but contradictory fact keywords, up to 30 pairs)
+            # strategy: find cases where the same pair of nodes has multiple RELATES_TO edges
             conflict_q = """
             MATCH (a {group_id: $gid})-[e1]->(b {group_id: $gid})
             MATCH (a)-[e2]->(b)
@@ -230,9 +225,9 @@ class DreamConsolidator:
                 })
 
             report.conflict_pairs = len(result["conflict_edges"])
-            logger.info(f"[orient] 矛盾 edges: {report.conflict_pairs}")
+            logger.info(f"[orient] conflicting edges: {report.conflict_pairs}")
 
-            # 1d. 找过期节点（created_at 超过 stale_days，无任何 edge 引用）
+            # 1d. find stale nodes (created_at older than stale_days, no edge references)
             stale_cutoff = datetime.now(timezone.utc) - timedelta(days=self.stale_days)
             stale_q = """
             MATCH (n {group_id: $gid})
@@ -250,7 +245,7 @@ class DreamConsolidator:
                 })
 
             report.stale_nodes = len(result["stale_nodes"])
-            logger.info(f"[orient] 过期孤立节点: {report.stale_nodes}")
+            logger.info(f"[orient] stale orphan nodes: {report.stale_nodes}")
 
         return result
 
@@ -260,20 +255,20 @@ class DreamConsolidator:
         self, agent_id: str, orient_result: dict
     ) -> list[dict]:
         """
-        聚合候选问题，每个"任务包"包含：
+        Aggregate candidate issues; each task bundle contains:
         - type: duplicate / conflict / stale
-        - nodes/edges 引用
-        - 供 LLM 判断用的上下文文本
+        - nodes/edges references
+        - context text for LLM decision-making
         """
         tasks = []
         driver = await self._get_driver()
 
         async with driver.session() as session:
-            # 打包重复节点任务
-            for group in orient_result["duplicate_groups"][:20]:  # 限制每次最多20组
-                # 拉取每个 uuid 的详细属性
+            # bundle duplicate node tasks
+            for group in orient_result["duplicate_groups"][:20]:  # limit to 20 groups per run
+                # fetch detailed attributes for each uuid
                 details = []
-                for uid in group["uuids"][:5]:  # 每组最多5个
+                for uid in group["uuids"][:5]:  # up to 5 per group
                     detail_q = """
                     MATCH (n {uuid: $uid})
                     RETURN n.name AS name, n.summary AS summary,
@@ -288,10 +283,10 @@ class DreamConsolidator:
                     "type": "duplicate",
                     "group_name": group["name"],
                     "nodes": details,
-                    "context": f"节点名称「{group['name']}」有 {group['count']} 个重复实例",
+                    "context": f"Node \"{group['name']}\" has {group['count']} duplicate instances",
                 })
 
-            # 打包矛盾 edges 任务
+            # bundle conflicting edge tasks
             for pair in orient_result["conflict_edges"][:15]:
                 tasks.append({
                     "type": "conflict",
@@ -299,21 +294,21 @@ class DreamConsolidator:
                     "tgt": pair["tgt"],
                     "edges": [pair["edge1"], pair["edge2"]],
                     "context": (
-                        f"「{pair['src']}」→「{pair['tgt']}」存在两条关系：\n"
+                        f"\"{pair['src']}\" -> \"{pair['tgt']}\" has two relationships:\n"
                         f"  1. {pair['edge1']['fact']}\n"
                         f"  2. {pair['edge2']['fact']}"
                     ),
                 })
 
-            # 打包过期节点（直接标记，不需要LLM判断）
+            # bundle stale node tasks (mark directly, no LLM decision needed)
             if orient_result["stale_nodes"]:
                 tasks.append({
                     "type": "stale",
                     "nodes": orient_result["stale_nodes"],
-                    "context": f"共 {len(orient_result['stale_nodes'])} 个超过 {self.stale_days} 天的孤立节点",
+                    "context": f"{len(orient_result['stale_nodes'])} orphan nodes older than {self.stale_days} days",
                 })
 
-        logger.info(f"[gather] 生成 {len(tasks)} 个任务包")
+        logger.info(f"[gather] generated {len(tasks)} task bundles")
         return tasks
 
     # ── Phase 3: Consolidate ───────────────────────────────────────────────────
@@ -322,13 +317,13 @@ class DreamConsolidator:
         self, tasks: list[dict], agent_id: str, report: DreamReport
     ) -> list[dict]:
         """
-        调用 LLM（gpt-4o-mini）对每个任务包作出决策
-        决策类型：
-        - merge: 合并重复节点（保留哪个 uuid）
-        - keep_latest: 保留最新 edge，删除旧的
-        - keep_both: 两条 edge 都保留（含义不同）
-        - delete: 删除过期节点
-        - skip: 跳过（数据不够充分）
+        Call LLM (gpt-4o-mini) to make a decision for each task bundle.
+        Decision types:
+        - merge: merge duplicate nodes (which uuid to keep)
+        - keep_latest: keep the newest edge, delete the old one
+        - keep_both: keep both edges (different meanings)
+        - delete: delete stale nodes
+        - skip: skip (insufficient data)
         """
         if not tasks:
             return []
@@ -338,58 +333,54 @@ class DreamConsolidator:
         for task in tasks:
             try:
                 if task["type"] == "stale":
-                    # 过期节点直接标记删除，不调 LLM
+                    # stale nodes are marked for deletion directly, no LLM call needed
                     for node in task["nodes"]:
                         actions.append({
                             "action": "delete_node",
                             "uuid": node["uuid"],
-                            "reason": f"孤立节点超过 {self.stale_days} 天",
+                            "reason": t("dream.stale_reason", days=self.stale_days),
                         })
                         report.pruned += 1
                     continue
 
-                # 构建 LLM prompt
+                # build LLM prompt
                 if task["type"] == "duplicate":
-                    prompt = f"""你是记忆图谱清洁工。以下是同名节点的详情：
-
-{task['context']}
-
-节点详情：
-{json.dumps(task['nodes'], ensure_ascii=False, indent=2)}
-
-请决定：
-1. merge — 合并为一个，指定保留的 uuid（最完整的那个）
-2. skip — 数据不足，跳过
-
-仅返回 JSON：{{"action": "merge或skip", "keep_uuid": "...", "reason": "..."}}"""
+                    prompt = t(
+                        "dream.consolidate_duplicate",
+                        context=task['context'],
+                        details=json.dumps(task['nodes'], ensure_ascii=False, indent=2),
+                    )
 
                 elif task["type"] == "conflict":
-                    prompt = f"""你是记忆图谱清洁工。以下是两条可能矛盾的关系：
-
-{task['context']}
-
-请决定：
-1. keep_latest — 保留时间更新的那条（通常是正确的），删除旧的
-2. keep_both — 两条含义不同，都保留
-3. skip — 数据不足
-
-仅返回 JSON：{{"action": "keep_latest或keep_both或skip", "delete_uuid": "...", "reason": "..."}}"""
+                    prompt = t(
+                        "dream.consolidate_conflict",
+                        context=task['context'],
+                    )
 
                 else:
                     continue
 
-                content = await chat_complete(
-                    prompt=prompt,
-                    max_tokens=200,
-                    temperature=0.0,
-                    json_mode=True,
-                )
+                try:
+                    content = await asyncio.wait_for(
+                        chat_complete(
+                            prompt=prompt,
+                            max_tokens=200,
+                            temperature=0.0,
+                            json_mode=True,
+                        ),
+                        timeout=60,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[consolidate] LLM call timed out for {task['type']} task"
+                    )
+                    continue
 
-                decision = json.loads(content)
+                decision = parse_llm_json(content)
                 decision["task_type"] = task["type"]
                 actions.append(decision)
 
-                # 更新报告计数
+                # update report counts
                 action = decision.get("action", "skip")
                 if action == "merge":
                     report.merged += 1
@@ -405,7 +396,7 @@ class DreamConsolidator:
                 )
 
             except Exception as e:
-                logger.warning(f"[consolidate] 任务处理失败: {e}")
+                logger.warning(f"[consolidate] task processing failed: {e}")
                 actions.append({
                     "action": "skip",
                     "task_type": task.get("type"),
@@ -420,13 +411,13 @@ class DreamConsolidator:
         self, actions: list[dict], agent_id: str, report: DreamReport
     ):
         """
-        执行图谱清理操作
-        - merge: 把非主节点的所有关系转移到主节点，删除副本
-        - keep_latest: 删除指定 edge
-        - delete_node: 删除孤立节点
+        Execute graph cleanup operations:
+        - merge: transfer all relationships from non-primary nodes to the primary node, delete duplicates
+        - keep_latest: delete the specified edge
+        - delete_node: delete orphan nodes
         """
         if not actions:
-            logger.info("[prune] 无需执行清理")
+            logger.info("[prune] no cleanup needed")
             return
 
         driver = await self._get_driver()
@@ -443,8 +434,8 @@ class DreamConsolidator:
                         keep_uuid = action.get("keep_uuid")
                         if not keep_uuid:
                             continue
-                        # 找出同名的其他节点，把它们的关系接到主节点，再删除
-                        # 这里做保守操作：只删除没有任何关系的重复节点
+                        # find other nodes with the same name, transfer their relationships to the primary node, then delete
+                        # conservative approach: only delete duplicate nodes that have no relationships
                         merge_q = """
                         MATCH (n {uuid: $uuid})
                         WITH n
@@ -456,7 +447,7 @@ class DreamConsolidator:
                         r = await session.run(merge_q, uuid=keep_uuid, gid=agent_id)
                         rec = await r.single()
                         deleted = rec["deleted"] if rec else 0
-                        logger.info(f"[prune] merge: 保留 {keep_uuid}, 删除 {deleted} 个孤立重复节点")
+                        logger.info(f"[prune] merge: keep {keep_uuid}, deleted {deleted} isolated duplicate nodes")
                         executed += deleted
 
                     elif act == "keep_latest":
@@ -468,7 +459,7 @@ class DreamConsolidator:
                         DELETE e
                         """
                         await session.run(del_q, uuid=delete_uuid)
-                        logger.info(f"[prune] keep_latest: 删除旧 edge {delete_uuid}")
+                        logger.info(f"[prune] keep_latest: deleted old edge {delete_uuid}")
                         executed += 1
 
                     elif act == "delete_node":
@@ -481,20 +472,20 @@ class DreamConsolidator:
                         DELETE n
                         """
                         await session.run(del_node_q, uuid=node_uuid)
-                        logger.info(f"[prune] delete_node: 删除过期节点 {node_uuid}")
+                        logger.info(f"[prune] delete_node: deleted stale node {node_uuid}")
                         executed += 1
 
                 except Exception as e:
-                    logger.warning(f"[prune] 执行 {act} 失败: {e}")
+                    logger.warning(f"[prune] executing {act} failed: {e}")
 
-        logger.info(f"[prune] 共执行 {executed} 次图谱变更")
+        logger.info(f"[prune] executed {executed} graph changes total")
 
-    # ── Phase 5: TTL 过期删除 ────────────────────────────────────────────────────
+    # ── Phase 5: TTL Expiry Deletion ─────────────────────────────────────────────
 
     async def phase5_ttl_expire(self, agent_id: str, report: DreamReport):
         """
-        删除超过 TTL 且 memocore_confidence < 0.3 的节点。
-        高置信度节点（>= 0.3）即使超过 TTL 也保留（重要记忆不强制删除）。
+        Delete nodes that have exceeded TTL and have memocore_confidence < 0.3.
+        High-confidence nodes (>= 0.3) are kept even if TTL is exceeded (important memories are not force-deleted).
         """
         ttl_cutoff = datetime.now(timezone.utc) - timedelta(days=self.ttl_days)
         driver = await self._get_driver()
@@ -513,51 +504,51 @@ class DreamConsolidator:
             rec = await r.single()
             deleted = rec["deleted"] if rec else 0
             report.expired = deleted
-            logger.info(f"[ttl] TTL 过期删除 {deleted} 个节点 (ttl={self.ttl_days}d)")
+            logger.info(f"[ttl] TTL expired, deleted {deleted} nodes (ttl={self.ttl_days}d)")
 
-    # ── Phase 6: 置信度衰减 ──────────────────────────────────────────────────────
+    # ── Phase 6: Confidence Decay ────────────────────────────────────────────────
 
     async def phase6_decay_confidence(self, agent_id: str, report: DreamReport):
         """
-        对长期未被引用的节点降低置信度评分。
+        Lower confidence scores for nodes that have not been referenced for a long time.
 
-        规则：
-          - 节点 30 天内未被任何 edge 引用 → confidence 降低 0.1（最低 0.1）
-          - 新建节点默认 memocore_confidence = 1.0（不存在时视为 1.0）
-          - 置信度 >= 0.7：标记为 confirmed（优先召回）
-          - 置信度 0.3-0.7：标记为 tentative（正常召回）
-          - 置信度 < 0.3：标记为 stale（召回时降权）
+        Rules:
+          - Node not referenced by any edge in 30 days → confidence reduced by 0.1 (minimum 0.1)
+          - New nodes default memocore_confidence = 1.0 (treated as 1.0 if absent)
+          - Confidence >= 0.7: marked as confirmed (priority recall)
+          - Confidence 0.3-0.7: marked as tentative (normal recall)
+          - Confidence < 0.3: marked as stale (decay on recall)
         """
         idle_cutoff = datetime.now(timezone.utc) - timedelta(days=30)
         driver = await self._get_driver()
 
         async with driver.session() as session:
-            # 找出 30 天未被 edge 引用的节点
+            # find nodes not referenced by any edge in the last 30 days
             decay_q = """
             MATCH (n {group_id: $gid})
             WHERE n.created_at < $cutoff AND NOT (n)--()
-            SET n.memocore_confidence = CASE
+            WITH n,
+              CASE
                 WHEN n.memocore_confidence IS NULL THEN 0.9
                 WHEN n.memocore_confidence - 0.1 < 0.1 THEN 0.1
                 ELSE n.memocore_confidence - 0.1
-            END,
-            n.memocore_status = CASE
-                WHEN (CASE WHEN n.memocore_confidence IS NULL THEN 0.9
-                      ELSE n.memocore_confidence END) - 0.1 >= 0.7 THEN 'confirmed'
-                WHEN (CASE WHEN n.memocore_confidence IS NULL THEN 0.9
-                      ELSE n.memocore_confidence END) - 0.1 >= 0.3 THEN 'tentative'
-                ELSE 'stale'
-            END
-            WITH n LIMIT 500
+              END AS new_conf
+            LIMIT 500
+            SET n.memocore_confidence = new_conf,
+                n.memocore_status = CASE
+                  WHEN new_conf >= 0.7 THEN 'confirmed'
+                  WHEN new_conf >= 0.3 THEN 'tentative'
+                  ELSE 'stale'
+                END
             RETURN count(n) AS updated
             """
             r = await session.run(decay_q, gid=agent_id, cutoff=idle_cutoff.isoformat())
             rec = await r.single()
             updated = rec["updated"] if rec else 0
             report.confidence_lowered = updated
-            logger.info(f"[confidence] 降权 {updated} 个节点")
+            logger.info(f"[confidence] decayed {updated} nodes")
 
-            # 对有关联 edge 的节点恢复置信度（被引用 = 活跃 = 有价值）
+            # restore confidence for nodes with associated edges (referenced = active = valuable)
             restore_q = """
             MATCH (n {group_id: $gid})
             WHERE (n)--()
@@ -574,31 +565,31 @@ class DreamConsolidator:
             r = await session.run(restore_q, gid=agent_id)
             rec = await r.single()
             restored = rec["restored"] if rec else 0
-            logger.info(f"[confidence] 恢复 {restored} 个活跃节点置信度")
+            logger.info(f"[confidence] restored confidence for {restored} active nodes")
 
-    # ── Phase 7: Compile — 知识编译 ─────────────────────────────────────────────
+    # ── Phase 7: Compile — Knowledge Compilation ────────────────────────────────
 
     async def phase7_compile(self, agent_id: str, report: DreamReport):
         """
-        将 Graph 中的碎片 facts 编译成结构化 CompiledPage 节点。
+        Compile fragmented facts from the Graph into structured CompiledPage nodes.
 
-        Karpathy 理念：知识应被编译一次，而非每次查询都从碎片重新推导。
-        CompiledPage 存储在 Neo4j 中（page_type=entity|concept|overview），
-        recall 时优先读取 CompiledPage 而非检索碎片 edges。
+        Karpathy philosophy: knowledge should be compiled once, not re-derived from
+        fragments on every query. CompiledPage is stored in Neo4j (page_type=entity|concept|overview);
+        recall preferentially reads CompiledPage rather than retrieving fragmented edges.
 
-        流程：
-        1. 找出所有有 edges 的实体节点
-        2. 对每个实体，收集其关联的所有 facts
-        3. 检查是否有已存在的 CompiledPage 且无新信息 → 跳过
-        4. 调用 LLM 将碎片 facts 编译成结构化 Markdown
-        5. MERGE 写入 CompiledPage 节点，建 COMPILED_FROM 边
-        6. 编译一个 overview（全局概览页）
+        Process:
+        1. Find all entity nodes with edges
+        2. For each entity, collect all associated facts
+        3. Check for existing CompiledPage with no new information → skip
+        4. Call LLM to compile fragmented facts into structured Markdown
+        5. MERGE write CompiledPage node, create COMPILED_FROM edge
+        6. Compile an overview (global summary page)
         """
-        logger.info(f"[compile] 开始知识编译 agent={agent_id}")
+        logger.info(f"[compile] starting knowledge compilation agent={agent_id}")
         driver = await self._get_driver()
 
         async with driver.session() as session:
-            # 7a. 找出所有有 edge 关联的实体
+            # 7a. find all entities with associated edges
             entity_q = """
             MATCH (n {group_id: $gid})-[e]->()
             WHERE n.name IS NOT NULL AND NOT n:CompiledPage
@@ -612,7 +603,7 @@ class DreamConsolidator:
             """
             r = await session.run(entity_q, gid=agent_id, max_nodes=self.max_nodes_per_run)
             entities = await r.data()
-            logger.info(f"[compile] 找到 {len(entities)} 个活跃实体")
+            logger.info(f"[compile] found {len(entities)} active entities")
 
             if not entities:
                 return
@@ -620,113 +611,132 @@ class DreamConsolidator:
             compiled_count = 0
             skipped_count = 0
 
-            for entity in entities:
+            # parallel compile configuration (enterprise: 200 entities from ~200s → ~20s)
+            compile_concurrency = int(os.getenv("MEMOCORE_COMPILE_CONCURRENCY", "10"))
+            sem = asyncio.Semaphore(compile_concurrency)
+
+            async def _compile_one(entity: dict) -> tuple[str, bool]:
+                """Compile a single entity, returns (entity_name, was_compiled). Each coroutine opens its own Neo4j session."""
                 entity_name = entity["name"]
                 entity_uuid = entity["uuid"]
 
-                # 7b. 检查是否需要重编译
-                existing_q = """
-                MATCH (p:CompiledPage {group_id: $gid, title: $title})
-                RETURN p.compiled_at AS compiled_at
-                """
-                r = await session.run(existing_q, gid=agent_id, title=entity_name)
-                existing = await r.single()
+                async with sem:
+                    driver = await self._get_driver()
+                    async with driver.session() as sess:
+                        # 7b. check whether recompilation is needed
+                        existing_q = """
+                        MATCH (p:CompiledPage {group_id: $gid, title: $title})
+                        RETURN p.compiled_at AS compiled_at
+                        """
+                        r = await sess.run(existing_q, gid=agent_id, title=entity_name)
+                        existing = await r.single()
 
-                latest_edge = entity.get("latest_edge")
-                if existing and latest_edge and existing["compiled_at"]:
-                    try:
-                        compiled_str = str(existing["compiled_at"])[:19]
-                        edge_str = str(latest_edge)[:19]
-                        if compiled_str >= edge_str:
-                            skipped_count += 1
-                            continue  # 无新信息
-                    except Exception:
-                        pass  # 时间比较失败时总是重编译
+                        latest_edge = entity.get("latest_edge")
+                        if existing and latest_edge and existing["compiled_at"]:
+                            try:
+                                compiled_str = str(existing["compiled_at"])[:19]
+                                edge_str = str(latest_edge)[:19]
+                                if compiled_str >= edge_str:
+                                    return entity_name, False  # no new information
+                            except Exception:
+                                pass
 
-                # 7c. 收集该实体的所有 facts
-                facts_q = """
-                MATCH (a {group_id: $gid})-[e]->(b {group_id: $gid})
-                WHERE a.uuid = $uuid OR b.uuid = $uuid
-                RETURN a.name AS src, b.name AS tgt, e.fact AS fact,
-                       e.created_at AS created_at
-                ORDER BY e.created_at DESC
-                LIMIT 50
-                """
-                r = await session.run(facts_q, gid=agent_id, uuid=entity_uuid)
-                facts = await r.data()
+                        # 7c. collect all facts for this entity
+                        facts_q = """
+                        MATCH (a {group_id: $gid})-[e]->(b {group_id: $gid})
+                        WHERE a.uuid = $uuid OR b.uuid = $uuid
+                        RETURN a.name AS src, b.name AS tgt, e.fact AS fact,
+                               e.created_at AS created_at
+                        ORDER BY e.created_at DESC
+                        LIMIT 50
+                        """
+                        r = await sess.run(facts_q, gid=agent_id, uuid=entity_uuid)
+                        facts = await r.data()
 
-                if not facts:
+                        if not facts:
+                            return entity_name, False
+
+                        # 7d. LLM compile
+                        facts_text = "\n".join(
+                            f"- [{f.get('src', '?')} → {f.get('tgt', '?')}] {f.get('fact', '')}"
+                            for f in facts
+                        )
+                        confidence = entity.get("confidence") or 1.0
+                        conf_label = "high" if confidence >= 0.7 else ("medium" if confidence >= 0.3 else "low")
+
+                        compile_prompt = t(
+                            "dream.compile_entity",
+                            entity_name=entity_name,
+                            entity_type=entity.get('entity_type', 'unknown'),
+                            confidence_label=conf_label,
+                            fact_count=len(facts),
+                            facts_text=facts_text,
+                        )
+
+                        try:
+                            compiled_content = await asyncio.wait_for(
+                                chat_complete(
+                                    prompt=compile_prompt,
+                                    max_tokens=800,
+                                    temperature=0.0,
+                                ),
+                                timeout=60,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"[compile] LLM call timed out for \"{entity_name}\""
+                            )
+                            return entity_name, False
+                        except Exception as e:
+                            logger.warning(f"[compile] LLM compilation of \"{entity_name}\" failed: {e}")
+                            return entity_name, False
+
+                        # 7e. MERGE write CompiledPage node
+                        now_str = datetime.now(timezone.utc).isoformat()
+                        upsert_q = """
+                        MERGE (p:CompiledPage {group_id: $gid, title: $title})
+                        SET p.content = $content,
+                            p.page_type = $page_type,
+                            p.confidence = $confidence,
+                            p.source_count = $source_count,
+                            p.compiled_at = $compiled_at,
+                            p.stale = false
+                        """
+                        await sess.run(upsert_q,
+                            gid=agent_id,
+                            title=entity_name,
+                            content=compiled_content,
+                            page_type="entity",
+                            confidence=confidence,
+                            source_count=len(facts),
+                            compiled_at=now_str,
+                        )
+
+                        # create COMPILED_FROM edge
+                        link_q = """
+                        MATCH (p:CompiledPage {group_id: $gid, title: $title})
+                        MATCH (n {group_id: $gid, uuid: $uuid})
+                        MERGE (p)-[:COMPILED_FROM]->(n)
+                        """
+                        await sess.run(link_q, gid=agent_id, title=entity_name, uuid=entity_uuid)
+
+                        logger.info(f"[compile] compiled \"{entity_name}\" ({len(facts)} facts)")
+                        return entity_name, True
+
+            # execute all entity compilations in parallel
+            results = await asyncio.gather(
+                *[_compile_one(e) for e in entities],
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(f"[compile] entity compilation exception: {result}")
+                elif result[1]:
+                    compiled_count += 1
+                else:
                     skipped_count += 1
-                    continue
 
-                # 7d. LLM 编译碎片 → 结构化知识
-                facts_text = "\n".join(
-                    f"- [{f.get('src', '?')} → {f.get('tgt', '?')}] {f.get('fact', '')}"
-                    for f in facts
-                )
-
-                confidence = entity.get("confidence") or 1.0
-                conf_label = "high" if confidence >= 0.7 else ("medium" if confidence >= 0.3 else "low")
-
-                compile_prompt = f"""你是知识编译器。将以下关于「{entity_name}」的碎片信息编译成一个结构化的知识页面。
-
-实体类型: {entity.get('entity_type', '未知')}
-当前置信度: {conf_label}
-
-碎片信息（{len(facts)} 条）:
-{facts_text}
-
-要求:
-1. 合并重复信息，去除冗余
-2. 如有矛盾，以最新的为准，旧的标注为「存疑」
-3. 按主题分段（如：概述、偏好、关系、近期动态）
-4. 用简洁的中文 Markdown 格式
-5. 不要编造碎片中没有的信息
-6. 总长度控制在 500 字以内"""
-
-                try:
-                    compiled_content = await chat_complete(
-                        prompt=compile_prompt,
-                        max_tokens=800,
-                        temperature=0.0,
-                    )
-                except Exception as e:
-                    logger.warning(f"[compile] LLM 编译「{entity_name}」失败: {e}")
-                    continue
-
-                # 7e. MERGE 写入 CompiledPage 节点
-                now_str = datetime.now(timezone.utc).isoformat()
-                upsert_q = """
-                MERGE (p:CompiledPage {group_id: $gid, title: $title})
-                SET p.content = $content,
-                    p.page_type = $page_type,
-                    p.confidence = $confidence,
-                    p.source_count = $source_count,
-                    p.compiled_at = $compiled_at,
-                    p.stale = false
-                """
-                await session.run(upsert_q,
-                    gid=agent_id,
-                    title=entity_name,
-                    content=compiled_content,
-                    page_type="entity",
-                    confidence=confidence,
-                    source_count=len(facts),
-                    compiled_at=now_str,
-                )
-
-                # 建 COMPILED_FROM 边（链接到源实体）
-                link_q = """
-                MATCH (p:CompiledPage {group_id: $gid, title: $title})
-                MATCH (n {group_id: $gid, uuid: $uuid})
-                MERGE (p)-[:COMPILED_FROM]->(n)
-                """
-                await session.run(link_q, gid=agent_id, title=entity_name, uuid=entity_uuid)
-
-                compiled_count += 1
-                logger.info(f"[compile] 编译「{entity_name}」完成 ({len(facts)} facts)")
-
-            # 7f. 编译全局 overview（如果有编译过的页面）
+            # 7f. compile global overview (if any pages have been compiled)
             overview_q = """
             MATCH (p:CompiledPage {group_id: $gid})
             WHERE p.page_type = 'entity'
@@ -743,16 +753,18 @@ class DreamConsolidator:
                     for p in all_pages
                 )
 
-                overview_prompt = f"""你是知识编译器。根据以下已编译的实体页面列表，写一段 200 字以内的总体概述，描述这个 Agent 记忆中的核心人物、关注领域和重要决策。
-
-已编译页面（{len(all_pages)} 个）:
-{page_index}
-
-要求: 简洁，不要罗列，提炼模式和核心信息。"""
+                overview_prompt = t(
+                    "dream.compile_overview",
+                    page_count=len(all_pages),
+                    page_index=page_index,
+                )
 
                 try:
-                    overview_content = await chat_complete(
-                        prompt=overview_prompt, max_tokens=400, temperature=0.0
+                    overview_content = await asyncio.wait_for(
+                        chat_complete(
+                            prompt=overview_prompt, max_tokens=400, temperature=0.0
+                        ),
+                        timeout=60,
                     )
                     now_str = datetime.now(timezone.utc).isoformat()
                     await session.run("""
@@ -762,35 +774,37 @@ class DreamConsolidator:
                             p.stale = false
                     """, gid=agent_id, content=overview_content,
                         compiled_at=now_str, cnt=len(all_pages))
+                except asyncio.TimeoutError:
+                    logger.warning("[compile] LLM call timed out for overview compilation")
                 except Exception as e:
-                    logger.warning(f"[compile] overview 编译失败: {e}")
+                    logger.warning(f"[compile] overview compilation failed: {e}")
 
             report.compiled_pages = compiled_count
             report.skipped_pages = skipped_count
             logger.info(
-                f"[compile] 完成: 编译={compiled_count} 跳过={skipped_count} 总页面={len(all_pages)}"
+                f"[compile] done: compiled={compiled_count} skipped={skipped_count} total_pages={len(all_pages)}"
             )
 
-    # ── Phase 8: Lint — 知识健康检查 ─────────────────────────────────────────────
+    # ── Phase 8: Lint — Knowledge Health Check ───────────────────────────────────
 
     async def phase8_lint(self, agent_id: str, report: DreamReport):
         """
-        检查 CompiledPage 之间的问题，输出 Karpathy 风格的健康报告。
+        Check for issues among CompiledPages and output a Karpathy-style health report.
 
-        检查项:
-        1. 矛盾 — 不同页面对同一事实描述冲突
-        2. 孤立页 — 无入站 COMPILED_FROM 边的实体页（源数据已被清理）
-        3. 缺页 — 在 facts 中被频繁提及但无 CompiledPage
-        4. 过期页 — 编译时间超过 14 天且源实体有新数据
+        Checks:
+        1. Contradictions — different pages describe the same fact in conflicting ways
+        2. Orphan pages — entity pages with no inbound COMPILED_FROM edge (source data cleaned up)
+        3. Missing pages — frequently referenced in facts but no CompiledPage exists
+        4. Stale pages — compiled more than 14 days ago and source entity has new data
 
-        输出写入 ~/.memocore/reports/{agent_id}/ 目录
+        Output written to get_state_dir()/reports/{agent_id}/ directory
         """
-        logger.info(f"[lint] 开始健康检查 agent={agent_id}")
+        logger.info(f"[lint] starting health check agent={agent_id}")
         driver = await self._get_driver()
         sections = []
 
         async with driver.session() as session:
-            # 8a. 编译状态统计
+            # 8a. compilation status stats
             stats_q = """
             MATCH (p:CompiledPage {group_id: $gid})
             WHERE p.page_type = 'entity'
@@ -809,9 +823,9 @@ class DreamConsolidator:
             rec = await r.single()
             total_facts = rec["cnt"] if rec else 0
 
-            sections.append(f"### 编译状态\n- 已编译实体页: {page_count}\n- 总 facts: {total_facts}")
+            sections.append(f"### Compilation Status\n- compiled entity pages: {page_count}\n- total facts: {total_facts}")
 
-            # 8b. 矛盾检测 — 同一对实体之间有多条不同 facts
+            # 8b. contradiction detection — multiple different facts between the same pair of entities
             contradiction_q = """
             MATCH (a {group_id: $gid})-[e1]->(b {group_id: $gid})
             MATCH (a)-[e2]->(b)
@@ -827,7 +841,7 @@ class DreamConsolidator:
             report.lint_contradictions = len(contradictions)
 
             if contradictions:
-                lines = [f"### 潜在矛盾 ({len(contradictions)})"]
+                lines = [f"### Potential Contradictions ({len(contradictions)})"]
                 for c in contradictions:
                     lines.append(
                         f"- **{c['src']}** -> **{c['tgt']}**\n"
@@ -836,7 +850,7 @@ class DreamConsolidator:
                     )
                 sections.append("\n".join(lines))
 
-            # 8c. 孤立 CompiledPage — 没有 COMPILED_FROM 边
+            # 8c. orphan CompiledPage — no COMPILED_FROM edge
             orphan_q = """
             MATCH (p:CompiledPage {group_id: $gid})
             WHERE p.page_type = 'entity'
@@ -848,12 +862,12 @@ class DreamConsolidator:
             report.lint_orphans = len(orphans)
 
             if orphans:
-                lines = [f"### 孤立页面 ({len(orphans)})"]
+                lines = [f"### Orphan Pages ({len(orphans)})"]
                 for o in orphans:
-                    lines.append(f"- `{o['title']}` — 源实体已被清理，建议删除或重编译")
+                    lines.append(f"- `{o['title']}` — source entity cleaned up, recommend deletion or recompilation")
                 sections.append("\n".join(lines))
 
-            # 8d. 缺页 — 被频繁提及但无 CompiledPage 的实体名
+            # 8d. missing pages — entity names frequently referenced but lacking a CompiledPage
             missing_q = """
             MATCH (n {group_id: $gid})
             WHERE n.name IS NOT NULL
@@ -872,7 +886,7 @@ class DreamConsolidator:
                 r = await session.run(missing_q, gid=agent_id)
                 missing = await r.data()
             except Exception:
-                # 旧版 Neo4j 不支持 count{} 语法，降级查询
+                # older Neo4j does not support count{} syntax, fall back to compatible query
                 missing_q_compat = """
                 MATCH (n {group_id: $gid})-[e]-()
                 WHERE n.name IS NOT NULL AND NOT n:CompiledPage
@@ -884,7 +898,7 @@ class DreamConsolidator:
                 """
                 r = await session.run(missing_q_compat, gid=agent_id)
                 candidates = await r.data()
-                # 手动排除已有 CompiledPage 的
+                # manually exclude entities that already have a CompiledPage
                 existing_pages_q = """
                 MATCH (p:CompiledPage {group_id: $gid})
                 RETURN p.title AS title
@@ -896,12 +910,12 @@ class DreamConsolidator:
             report.lint_missing = len(missing)
 
             if missing:
-                lines = [f"### 缺失页面 ({len(missing)})"]
+                lines = [f"### Missing Pages ({len(missing)})"]
                 for m in missing:
-                    lines.append(f"- **{m['name']}** — 被引用 {m['ref_count']} 次，建议编译")
+                    lines.append(f"- **{m['name']}** — referenced {m['ref_count']} times, recommend compilation")
                 sections.append("\n".join(lines))
 
-            # 8e. 过期页 — 编译时间超过 14 天
+            # 8e. stale pages — compiled more than 14 days ago
             stale_q = """
             MATCH (p:CompiledPage {group_id: $gid})
             WHERE p.page_type = 'entity'
@@ -914,13 +928,13 @@ class DreamConsolidator:
             report.lint_stale_pages = len(stale_pages)
 
             if stale_pages:
-                lines = [f"### 过期页面 ({len(stale_pages)})"]
+                lines = [f"### Stale Pages ({len(stale_pages)})"]
                 for s in stale_pages:
-                    lines.append(f"- `{s['title']}` — 编译于 {str(s['compiled_at'])[:10]}，建议重编译")
+                    lines.append(f"- `{s['title']}` — compiled at {str(s['compiled_at'])[:10]}, recommend recompilation")
                 sections.append("\n".join(lines))
 
-        # 8f. 写入报告文件
-        report_dir = Path.home() / ".memocore" / "reports" / agent_id
+        # 8f. write report file
+        report_dir = get_state_dir() / "reports" / make_safe_agent_key(agent_id)
         report_dir.mkdir(parents=True, exist_ok=True)
         report_file = report_dir / f"{datetime.now().strftime('%Y-%m-%d')}.md"
 
@@ -932,82 +946,91 @@ class DreamConsolidator:
 
         if not (report.lint_contradictions or report.lint_orphans
                 or report.lint_missing or report.lint_stale_pages):
-            report_md += "\n\n*All clear — 未发现问题。*"
+            report_md += "\n\n*All clear — no issues found.*"
 
         report_file.write_text(report_md, encoding="utf-8")
         report.lint_report_path = str(report_file)
-        logger.info(f"[lint] 报告已写入 {report_file}")
+        logger.info(f"[lint] report written to {report_file}")
 
 
-# ─── 主入口 ────────────────────────────────────────────────────────────────────
+# ─── Main entrypoint ─────────────────────────────────────────────────────────
 
 async def run_dream(
-    agent_id: str = "aoxia",
+    agent_id: str = "default",
     dry_run: bool = False,
 ) -> DreamReport:
     """
-    运行完整 Dream 巩固流程
+    Run the complete Dream consolidation pipeline.
 
     Args:
         agent_id: Agent namespace
-        dry_run: True 时只扫描不执行清理（用于调试）
+        dry_run: When True, scan only without executing cleanup (for debugging)
 
     Returns:
-        DreamReport — 运行报告
+        DreamReport — run report
     """
     report = DreamReport(agent_id=agent_id)
+    agent_id = validate_agent_id(agent_id)
     consolidator = DreamConsolidator()
 
-    logger.info(f"=== Dream 开始 | agent={agent_id} dry_run={dry_run} ===")
+    # clean up stale session flag files (prevent accumulation of millions of files)
+    try:
+        cleaned = cleanup_old_session_flags()
+        if cleaned:
+            logger.info(f"[cleanup] cleaned up {cleaned} stale session flag files")
+    except Exception as e:
+        logger.warning(f"[cleanup] session flag cleanup failed: {e}")
+
+    logger.info(f"=== Dream starting | agent={agent_id} dry_run={dry_run} ===")
 
     try:
         # Phase 1: Orient
-        logger.info("[phase1] Orient — 扫描图谱")
+        logger.info("[phase1] Orient — scanning graph")
         orient_result = await consolidator.phase1_orient(agent_id, report)
 
         # Phase 2: Gather
-        logger.info("[phase2] Gather — 聚合候选问题")
+        logger.info("[phase2] Gather — aggregating candidate issues")
         tasks = await consolidator.phase2_gather(agent_id, orient_result)
 
         # Phase 3: Consolidate
-        logger.info("[phase3] Consolidate — LLM 决策")
+        logger.info("[phase3] Consolidate — LLM decision")
         actions = await consolidator.phase3_consolidate(tasks, agent_id, report)
 
         # Phase 4: Prune
         if dry_run:
-            logger.info(f"[phase4] Prune — dry_run=True，跳过执行，计划操作数={len(actions)}")
+            logger.info(f"[phase4] Prune — dry_run=True, skipping execution, planned operations={len(actions)}")
         else:
-            logger.info("[phase4] Prune — 执行图谱清理")
+            logger.info("[phase4] Prune — executing graph cleanup")
             await consolidator.phase4_prune(actions, agent_id, report)
 
-        # Phase 5: TTL 过期删除
+        # Phase 5: TTL expiry deletion
         if not dry_run:
-            logger.info("[phase5] TTL — 删除超期低置信度节点")
+            logger.info("[phase5] TTL — deleting expired low-confidence nodes")
             await consolidator.phase5_ttl_expire(agent_id, report)
 
-        # Phase 6: 置信度衰减与恢复
+        # Phase 6: Confidence decay and restore
         if not dry_run:
-            logger.info("[phase6] Confidence — 更新节点置信度评分")
+            logger.info("[phase6] Confidence — updating node confidence scores")
             await consolidator.phase6_decay_confidence(agent_id, report)
 
-        # Phase 7: Compile — 知识编译（碎片 facts → 结构化 CompiledPage）
+        # Phase 7: Compile — knowledge compilation (fragmented facts → structured CompiledPage)
         if not dry_run:
-            logger.info("[phase7] Compile — 编译结构化知识页面")
+            logger.info("[phase7] Compile — compiling structured knowledge pages")
             await consolidator.phase7_compile(agent_id, report)
 
-        # Phase 8: Lint — 知识健康检查
-        logger.info("[phase8] Lint — 健康检查")
+        # Phase 8: Lint — knowledge health check
+        logger.info("[phase8] Lint — health check")
         await consolidator.phase8_lint(agent_id, report)
 
         report.status = "done"
         report.finished_at = datetime.now(timezone.utc)
-        logger.info(f"=== Dream 完成 === {report.summary()}")
+        logger.info(f"=== Dream complete === {report.summary()}")
 
     except Exception as e:
         report.status = "failed"
         report.error = str(e)
         report.finished_at = datetime.now(timezone.utc)
-        logger.error(f"=== Dream 失败: {e} ===")
+        logger.error(f"=== Dream failed: {e} ===")
 
     finally:
         await consolidator.close()
@@ -1016,12 +1039,14 @@ async def run_dream(
 
 
 def main():
-    """命令行入口"""
+    """CLI entrypoint for running Dream consolidation."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="MemOS Dream 记忆巩固")
-    parser.add_argument("--agent-id", default="aoxia", help="Agent namespace")
-    parser.add_argument("--dry-run", action="store_true", help="只扫描，不执行清理")
+    _configure_dream_logging()
+
+    parser = argparse.ArgumentParser(description="Memocore Dream — memory consolidation")
+    parser.add_argument("--agent-id", default="default", help="Agent namespace")
+    parser.add_argument("--dry-run", action="store_true", help="Scan only, do not execute cleanup")
     args = parser.parse_args()
 
     report = asyncio.run(run_dream(agent_id=args.agent_id, dry_run=args.dry_run))

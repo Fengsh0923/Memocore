@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Claude Code Stop Hook
-触发时机：每次对话结束（Claude Code 的 Stop 事件）
-功能：读取本次对话内容 → 提炼记忆 → 写入 Graphiti/Neo4j
-      满足 MEMOCORE_DREAM_INTERVAL 次会话后后台触发 Dream 巩固
+Memocore Stop Hook for Claude Code
+Trigger: end of each conversation (Claude Code Stop event)
+Function: read conversation transcript -> extract memory -> write to knowledge graph
+          Trigger Dream consolidation in background every MEMOCORE_DREAM_INTERVAL sessions.
 
-使用方式（在 ~/.claude/settings.json 里配置）：
+Config (in ~/.claude/settings.json):
 {
   "hooks": {
     "Stop": [{
@@ -19,17 +19,10 @@ Claude Code Stop Hook
   }
 }
 
-Claude Code Stop hook 通过 stdin 传入 JSON：
-{
-  "session_id": "...",
-  "transcript": [{"role": "user"|"assistant", "content": "..."}],
-  "stop_hook_active": true
-}
-
-环境变量：
-  MEMOCORE_AGENT_ID         — Agent namespace（默认 "aoxia"）
-  MEMOCORE_DREAM_INTERVAL   — Dream 触发间隔会话数（默认 5）
-  MEMOCORE_LLM_PROVIDER     — LLM provider（默认自动检测）
+Environment variables:
+  MEMOCORE_AGENT_ID         — Agent namespace (default "default")
+  MEMOCORE_DREAM_INTERVAL   — Dream trigger interval in sessions (default 5)
+  MEMOCORE_LLM_PROVIDER     — LLM provider (default: auto-detect)
 """
 
 import sys
@@ -40,37 +33,23 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 
-# 确保能 import memocore
-_project_root = Path(__file__).parent.parent.parent.parent
-sys.path.insert(0, str(_project_root))
+from memocore.core.config import get_agent_id, should_run_dream, validate_agent_id
+from memocore.agents.registry import get_profile as _get_profile
 
-# 加载 .env
-from dotenv import load_dotenv
-_env_path = _project_root / ".env"
-if _env_path.exists():
-    load_dotenv(_env_path)
-
-from memocore.core.config import get_agent_id, should_run_dream, get_logs_dir
-from memocore.agents.aoxia.schema import AOXIA_PROFILE
+logger = logging.getLogger("memocore.stop_hook")
 
 
-def _get_profile(agent_id: str) -> dict:
-    if agent_id == "aoxia":
-        return AOXIA_PROFILE
-    return {"user_display_name": "User", "assistant_display_name": "Assistant"}
-
-
-LOG_FILE = get_logs_dir() / "stop_hook.log"
-
-logging.basicConfig(
-    filename=str(LOG_FILE),
-    level=logging.INFO,
-    format="%(asctime)s [stop_hook] %(message)s",
-)
+def _configure_logging():
+    from memocore.core.config import get_logs_dir
+    log_file = get_logs_dir() / "stop_hook.log"
+    handler = logging.FileHandler(str(log_file))
+    handler.setFormatter(logging.Formatter("%(asctime)s [stop_hook] %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 
 def parse_transcript(transcript: list, profile: dict) -> str:
-    """把 transcript 列表转成可提炼的纯文本"""
+    """Convert transcript list to extractable plain text."""
     user_name = profile.get("user_display_name", "User")
     assistant_name = profile.get("assistant_display_name", "Assistant")
 
@@ -79,7 +58,7 @@ def parse_transcript(transcript: list, profile: dict) -> str:
         role = turn.get("role", "unknown")
         content = turn.get("content", "")
 
-        # content 可能是字符串或列表（tool_use 等）
+        # content may be a string or a list (tool_use etc.)
         if isinstance(content, list):
             text_parts = [
                 c.get("text", "") for c in content
@@ -88,21 +67,21 @@ def parse_transcript(transcript: list, profile: dict) -> str:
             content = " ".join(text_parts)
 
         if content and content.strip():
-            # 按 token 估算截断：约 4 字符 ≈ 1 token，限 300 token/条
+            # Rough token estimate: ~4 chars per token, limit 300 tokens/turn
             text = content.strip()
             if len(text) > 1200:
-                text = text[:1200] + "…"
+                text = text[:1200] + "..."
             prefix = user_name if role == "user" else assistant_name
-            lines.append(f"{prefix}：{text}")
+            lines.append(f"{prefix}: {text}")
 
     return "\n".join(lines)
 
 
 def should_extract(transcript_text: str) -> bool:
-    """判断是否值得提炼（过滤掉没有实质内容的短对话）"""
+    """Determine if extraction is worthwhile (filter short/trivial conversations)."""
     if len(transcript_text) < 200:
         return False
-    skip_keywords = ["你好", "在吗", "测试", "hello", "test"]
+    skip_keywords = ["hello", "test", "hi", "ping"]
     first_line = transcript_text.split("\n")[0].lower()
     if any(k in first_line for k in skip_keywords):
         return False
@@ -110,76 +89,75 @@ def should_extract(transcript_text: str) -> bool:
 
 
 def _spawn_dream_background(agent_id: str):
-    """
-    在独立子进程后台运行 Dream，不阻塞 stop hook 返回
-    """
+    """Spawn Dream as a detached subprocess, non-blocking."""
     dream_script = Path(__file__).parent.parent.parent / "core" / "dream.py"
     try:
         subprocess.Popen(
             [sys.executable, str(dream_script), "--agent-id", agent_id],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,  # 与父进程完全解耦
+            start_new_session=True,
         )
-        logging.info(f"[dream] 已在后台启动 Dream 子进程 agent={agent_id}")
+        logger.info(f"[dream] spawned background Dream subprocess agent={agent_id}")
     except Exception as e:
-        logging.warning(f"[dream] 启动后台 Dream 失败（非致命）: {e}")
+        logger.warning(f"[dream] failed to spawn background Dream (non-fatal): {e}")
 
 
 async def run(hook_input: dict):
     from memocore.core.extractor import extract_and_store
 
-    agent_id = get_agent_id()
+    agent_id = validate_agent_id(get_agent_id())
     profile = _get_profile(agent_id)
     transcript = hook_input.get("transcript", [])
     session_id = hook_input.get("session_id", "unknown")
 
     if not transcript:
-        logging.info(f"session={session_id} transcript 为空，跳过")
+        logger.info(f"session={session_id} transcript empty, skipping")
         return
 
     transcript_text = parse_transcript(transcript, profile)
 
     if not should_extract(transcript_text):
-        logging.info(f"session={session_id} 内容太短或无实质内容，跳过")
+        logger.info(f"session={session_id} content too short or trivial, skipping")
         return
 
-    logging.info(f"session={session_id} 开始提炼，文本长度={len(transcript_text)}")
+    logger.info(f"session={session_id} starting extraction, text_len={len(transcript_text)}")
 
-    # Step 1: 提炼写入
+    # Step 1: Extract and store
     result = await extract_and_store(
         conversation=transcript_text,
         agent_id=agent_id,
-        source_description=f"Claude Code 对话 | session={session_id} | {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        source_description=f"conversation | session={session_id} | {datetime.now().strftime('%Y-%m-%d %H:%M')}",
     )
 
     if result["success"]:
-        logging.info(
-            f"session={session_id} 提炼成功: "
+        logger.info(
+            f"session={session_id} extraction succeeded: "
             f"episode={result['episode_name']} "
             f"entities={result.get('entities_extracted', '?')}"
         )
     else:
-        logging.error(f"session={session_id} 提炼失败: {result.get('error')}")
-        return  # 提炼失败时不触发 Dream
+        logger.error(f"session={session_id} extraction failed: {result.get('error')}")
+        return  # Don't trigger Dream on extraction failure
 
-    # Step 2: Dream 巩固（后台子进程，不阻塞 hook 返回）
-    # 使用持久化计数器，保证每 MEMOCORE_DREAM_INTERVAL 次必触发一次
+    # Step 2: Dream consolidation (background subprocess, non-blocking)
     if should_run_dream(agent_id):
-        logging.info(f"session={session_id} 计数器达到阈值，触发后台 Dream...")
+        logger.info(f"session={session_id} counter reached threshold, triggering background Dream...")
         _spawn_dream_background(agent_id)
     else:
-        logging.info(f"session={session_id} Dream 计数未达阈值，跳过")
+        logger.info(f"session={session_id} Dream counter below threshold, skipping")
 
 
 def main():
+    _configure_logging()
+
     try:
         raw = sys.stdin.read()
         if not raw.strip():
             return
         hook_input = json.loads(raw)
     except Exception as e:
-        logging.error(f"读取 hook 输入失败: {e}")
+        logger.error(f"failed to read hook input: {e}")
         return
 
     asyncio.run(run(hook_input))
