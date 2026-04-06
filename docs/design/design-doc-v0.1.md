@@ -1,12 +1,13 @@
-# MemOS — 设计文档 v0.1
+# Memocore — 设计文档 v0.1
 
 > 状态：Phase 3 Eng Review 通过 | 2026-04-03
+> 注：本文档为早期设计蓝图，v1.0 实现已超出此范围，以 README.md 为准。
 
 ---
 
 ## 定位
 
-**Agent通用记忆层**，让企业用户感觉不到"记忆"这件事的存在。
+**Agent 通用记忆层**，让企业用户感觉不到"记忆"这件事的存在。
 
 不是重新造轮子，是把 Graphiti 真正插到各个 Agent 平台上——这件事 Graphiti 没做。
 
@@ -14,11 +15,11 @@
 
 ## 用户层次（三层递进）
 
-| 层 | 用户 | 场景 | 时间线 |
-|----|------|------|--------|
-| L1 验证层 | 飞虾队（鳌虾先跑） | 替代 memory.md，跨会话结构化记忆 | M1-M2 |
-| L2 平台层 | Claude Code / OpenClaw | 跨平台适配器，各平台插件化接入，开源 | M3-M4 |
-| L3 企业层 | 公司内部 Agent 用户 | 企业知识图谱沉淀，多租户，零感知 | M5-M6 |
+| 层 | 场景 | 时间线 |
+|----|------|--------|
+| L1 验证层 | 替代 memory.md，跨会话结构化记忆 | M1-M2 |
+| L2 平台层 | 跨平台适配器，各平台插件化接入，开源 | M3-M4 |
+| L3 企业层 | 企业知识图谱沉淀，多租户，零感知 | M5-M6 |
 
 ---
 
@@ -34,11 +35,12 @@
 
 ```
 ┌─────────────────────────────────────────────┐
-│                MemOS                         │
+│                Memocore                      │
 │                                             │
 │  接入层                                      │
-│  ├── Claude Code hooks (Stop/PostToolUse)   │
-│  ├── OpenClaw MCP Plugin                    │
+│  ├── Claude Code hooks (Prompt/Stop)        │
+│  ├── MCP Server (stdio / HTTP)              │
+│  ├── IM Bridge (Slack/Teams 等)              │
 │  └── REST API（企业接入）                    │
 │                                             │
 │  适配层                                      │
@@ -59,17 +61,6 @@
 
 ---
 
-## 6个月里程碑
-
-- **M1（第1个月）**：鳌虾 × Graphiti 记忆闭环跑通，替代 memory.md
-- **M2（第2个月）**：飞虾队全员接入，跨虾记忆可查询
-- **M3（第3个月）**：抽象为通用 SDK，开源发布 v0.1
-- **M4（第4个月）**：Claude Code + OpenClaw 插件发布
-- **M5（第5个月）**：企业内部一个 Agent 接入（销售或 BI）
-- **M6（第6个月）**：多租户稳定，企业 Demo 可汇报
-
----
-
 ## 参考实现
 
 | 项目 | 借鉴点 |
@@ -78,4 +69,3 @@
 | honcho | 持续学习机制，实体状态演化 |
 | hermes-agent | 自我进化记忆，Agent 成长机制 |
 | deer-flow | memory middleware 分层架构 |
-| OpenClaw | memory tool manager，工具化封装 |
