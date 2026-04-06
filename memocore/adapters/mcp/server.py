@@ -227,10 +227,13 @@ async def memory_recall(
         logger.warning(f"memory_recall: invalid parameters: {e}")
         return f"Invalid parameters: {e}"
 
+    # Clamp top_k to prevent query amplification
+    top_k = min(max(1, top_k), 50)
+
     safe_sid = _sanitize_session_id(session_id)
     logger.info(
         f"memory_recall: agent={resolved_agent_id[:24]} session={safe_sid[:16]} "
-        f"team={team_id} tenant={tenant_id} query={_sanitize_log(query)}"
+        f"team={_sanitize_log(str(team_id))} tenant={_sanitize_log(str(tenant_id))} query={_sanitize_log(query)}"
     )
 
     try:
@@ -308,9 +311,23 @@ async def memory_session_start(
         return f"Invalid agent_id: {e}"
 
     safe_sid = _sanitize_session_id(session_id)
+
+    # Validate scope IDs (same validation as memory_recall/memory_store)
+    try:
+        if team_id:
+            validate_scope_id(team_id, "team_id")
+        if tenant_id:
+            validate_scope_id(tenant_id, "tenant_id")
+    except ValueError as e:
+        logger.warning(f"memory_session_start: invalid scope id: {e}")
+        return f"Invalid scope id: {e}"
+
+    # Clamp top_k to prevent query amplification
+    top_k = min(max(1, top_k), 50)
+
     logger.info(
         f"memory_session_start: agent={resolved_agent_id[:24]} session={safe_sid[:16]} "
-        f"team={team_id} tenant={tenant_id}"
+        f"team={_sanitize_log(str(team_id))} tenant={_sanitize_log(str(tenant_id))}"
     )
 
     # Mark as initialized to prevent memory_recall from re-triggering full recall

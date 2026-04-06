@@ -455,10 +455,10 @@ class DreamConsolidator:
                         if not delete_uuid:
                             continue
                         del_q = """
-                        MATCH ()-[e {uuid: $uuid}]->()
+                        MATCH ()-[e {uuid: $uuid, group_id: $gid}]->()
                         DELETE e
                         """
-                        await session.run(del_q, uuid=delete_uuid)
+                        await session.run(del_q, uuid=delete_uuid, gid=agent_id)
                         logger.info(f"[prune] keep_latest: deleted old edge {delete_uuid}")
                         executed += 1
 
@@ -467,11 +467,11 @@ class DreamConsolidator:
                         if not node_uuid:
                             continue
                         del_node_q = """
-                        MATCH (n {uuid: $uuid})
+                        MATCH (n {uuid: $uuid, group_id: $gid})
                         WHERE NOT (n)--()
                         DELETE n
                         """
-                        await session.run(del_node_q, uuid=node_uuid)
+                        await session.run(del_node_q, uuid=node_uuid, gid=agent_id)
                         logger.info(f"[prune] delete_node: deleted stale node {node_uuid}")
                         executed += 1
 

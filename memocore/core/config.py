@@ -329,7 +329,9 @@ def write_global_config(values: dict) -> Path:
         "",
     ]
     for k, v in existing.items():
-        lines.append(f"{k}={v}")
+        # Strip newlines/carriage returns to prevent config injection
+        safe_v = v.replace('\n', '').replace('\r', '')
+        lines.append(f"{k}={safe_v}")
 
     config_path.write_text("\n".join(lines) + "\n")
     return config_path

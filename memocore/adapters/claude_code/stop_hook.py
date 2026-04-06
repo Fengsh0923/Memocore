@@ -127,7 +127,7 @@ async def run(hook_input: dict):
     result = await extract_and_store(
         conversation=transcript_text,
         agent_id=agent_id,
-        source_description=f"conversation | session={session_id} | {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        source_description=f"conversation | session={session_id[:16]} | {datetime.now().strftime('%Y-%m-%d %H:%M')}",
     )
 
     if result["success"]:
