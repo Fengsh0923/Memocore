@@ -25,9 +25,30 @@ if _env_path.exists():
     load_dotenv(_env_path)
 
 from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
-from memocore.core.llm_adapter import rerank as llm_rerank
+from memocore.core.llm_adapter import rerank as llm_rerank, chat_complete
 from memocore.core.graphiti_factory import build_graphiti
 from memocore.agents.aoxia.schema import AOXIA_PROFILE
+
+
+async def llm_rerank_titles(query: str, pages: list[dict], top_k: int) -> list[dict]:
+    """用 LLM 从 CompiledPage 标题列表中挑选与 query 最相关的页面"""
+    import json as _json
+
+    index = "\n".join(
+        f"{i}. {p['title']}" for i, p in enumerate(pages)
+    )
+    prompt = f"""从以下知识页面标题中，选出与问题最相关的 {top_k} 个。
+
+问题: {query}
+
+页面列表:
+{index}
+
+仅返回 JSON 数组，包含选中页面的序号（0-indexed），如: [0, 3, 5]"""
+
+    content = await chat_complete(prompt=prompt, max_tokens=100, temperature=0.0, json_mode=True)
+    indices = _json.loads(content)
+    return [pages[i] for i in indices if 0 <= i < len(pages)]
 
 
 def _filter_by_confidence(results: list, min_confidence: float = 0.2) -> list:
@@ -56,10 +77,15 @@ def _get_profile(agent_id: str) -> dict:
 
 class MemoryRetriever:
     """
-    记忆召回器 v2
-    - Stage 1: Graphiti 语义+图遍历混合检索（top_k_stage1 条，默认20）
-    - Stage 2: gpt-4o-mini 精筛（top_k_final 条，默认5）
-    - 输出格式化的 Markdown，可直接注入 system prompt
+    记忆召回器 v3
+
+    recall 优先级:
+    1. CompiledPage（Dream 编译的结构化知识）→ 直接 Neo4j 查询，命中即返回
+    2. Graphiti 语义+图遍历混合检索 → 碎片 facts 降级路径
+
+    CompiledPage 是 Karpathy LLM Wiki 理念的实现：
+    知识被编译一次（Dream Phase 7），recall 时直接读取已编译的页面，
+    而非每次从碎片 facts 重新推导。
     """
 
     def __init__(
@@ -76,6 +102,83 @@ class MemoryRetriever:
         self.top_k_stage1 = top_k_stage1
         self.top_k_final = top_k_final
         self._graphiti: Optional[Graphiti] = None
+        self._driver = None
+
+    async def _get_neo4j_driver(self):
+        """获取 Neo4j 驱动（用于 CompiledPage 直接查询，不走 Graphiti）"""
+        if self._driver is None:
+            from neo4j import AsyncGraphDatabase
+            self._driver = AsyncGraphDatabase.driver(
+                self.neo4j_uri, auth=(self.neo4j_user, self.neo4j_password)
+            )
+        return self._driver
+
+    async def _recall_compiled_pages(
+        self, query: str, group_ids: list[str], top_k: int = 5
+    ) -> Optional[str]:
+        """
+        从 CompiledPage 节点中检索相关页面。
+        使用 Neo4j 全文索引或 title 模糊匹配。
+        返回编译好的知识文本，或 None（无 CompiledPage 时降级到 Graphiti）。
+        """
+        driver = await self._get_neo4j_driver()
+
+        all_pages = []
+        async with driver.session() as session:
+            for gid in group_ids:
+                # 查询该 group 的所有 CompiledPage
+                q = """
+                MATCH (p:CompiledPage {group_id: $gid})
+                WHERE p.page_type = 'entity' AND p.stale = false
+                RETURN p.title AS title, p.content AS content,
+                       p.confidence AS confidence, p.source_count AS source_count,
+                       p.compiled_at AS compiled_at
+                ORDER BY p.source_count DESC
+                """
+                r = await session.run(q, gid=gid)
+                pages = await r.data()
+                for p in pages:
+                    # 标记 scope
+                    if gid.startswith("team:"):
+                        p["_scope_label"] = "团队"
+                    elif gid.startswith("org:"):
+                        p["_scope_label"] = "组织"
+                    else:
+                        p["_scope_label"] = "个人"
+                all_pages.extend(pages)
+
+        if not all_pages:
+            return None  # 没有 CompiledPage，降级
+
+        # 构建 index（标题列表），让 LLM 选择相关页面
+        # 页面少时（<= top_k）直接全部返回，不需要 LLM 筛选
+        if len(all_pages) <= top_k:
+            relevant_pages = all_pages
+        else:
+            # 用 LLM 从 index 中挑选与 query 最相关的页面
+            index_text = "\n".join(
+                f"{i+1}. [{p.get('_scope_label', '')}] {p['title']} (facts: {p.get('source_count', 0)})"
+                for i, p in enumerate(all_pages)
+            )
+            try:
+                selection = await llm_rerank_titles(query, all_pages, top_k)
+                relevant_pages = selection
+            except Exception:
+                # LLM 筛选失败时取 source_count 最高的
+                relevant_pages = all_pages[:top_k]
+
+        if not relevant_pages:
+            return None
+
+        # 格式化输出
+        now = datetime.now().strftime('%Y-%m-%d %H:%M')
+        lines = [f"## 相关记忆（已编译知识）\n*{now}*\n"]
+        for p in relevant_pages:
+            scope = p.get("_scope_label", "")
+            prefix = f"[{scope}] " if scope else ""
+            lines.append(f"### {prefix}{p['title']}\n")
+            lines.append(p.get("content", "") + "\n")
+        return "\n".join(lines)
 
     async def _get_graphiti(self):
         if self._graphiti is None:
@@ -146,6 +249,21 @@ class MemoryRetriever:
         if not query.strip():
             return ""
 
+        # ── 优先尝试 CompiledPage（编译后的结构化知识）──
+        group_ids = [agent_id]
+        if team_id:
+            group_ids.append(f"team:{team_id}")
+        if tenant_id:
+            group_ids.append(f"org:{tenant_id}")
+
+        try:
+            compiled = await self._recall_compiled_pages(query, group_ids, top_k)
+            if compiled:
+                return compiled  # 命中编译知识，直接返回
+        except Exception as e:
+            pass  # CompiledPage 查询失败，降级到 Graphiti
+
+        # ── 降级：Graphiti 碎片 facts 检索 ──
         try:
             graphiti = await self._get_graphiti()
             stage1_k = self.top_k_stage1 if use_rerank else top_k
@@ -211,10 +329,53 @@ class MemoryRetriever:
         """
         import asyncio as _asyncio
 
+        # ── 优先尝试 CompiledPage（overview + 全部 entity 页面）──
+        group_ids = [agent_id]
+        if team_id:
+            group_ids.append(f"team:{team_id}")
+        if tenant_id:
+            group_ids.append(f"org:{tenant_id}")
+
+        try:
+            driver = await self._get_neo4j_driver()
+            pages_content = []
+            async with driver.session() as session:
+                for gid in group_ids:
+                    # overview 页面
+                    ov_q = """
+                    MATCH (p:CompiledPage {group_id: $gid, title: '__overview__'})
+                    RETURN p.content AS content
+                    """
+                    r = await session.run(ov_q, gid=gid)
+                    rec = await r.single()
+                    if rec and rec["content"]:
+                        scope = "个人" if not gid.startswith(("team:", "org:")) else ("团队" if gid.startswith("team:") else "组织")
+                        pages_content.append(f"### [{scope}] 总览\n\n{rec['content']}")
+
+                    # 所有 entity 页面（top_k 个）
+                    ep_q = """
+                    MATCH (p:CompiledPage {group_id: $gid})
+                    WHERE p.page_type = 'entity' AND p.stale = false
+                    RETURN p.title AS title, p.content AS content
+                    ORDER BY p.source_count DESC
+                    LIMIT $limit
+                    """
+                    r = await session.run(ep_q, gid=gid, limit=top_k // max(1, len(group_ids)))
+                    entity_pages = await r.data()
+                    for ep in entity_pages:
+                        scope = "个人" if not gid.startswith(("team:", "org:")) else ("团队" if gid.startswith("team:") else "组织")
+                        pages_content.append(f"### [{scope}] {ep['title']}\n\n{ep.get('content', '')}")
+
+            if pages_content:
+                now = datetime.now().strftime('%Y-%m-%d %H:%M')
+                return f"## 记忆背景（已编译知识）\n*{now}*\n\n" + "\n\n".join(pages_content)
+        except Exception:
+            pass  # 降级到 Graphiti
+
+        # ── 降级：Graphiti 碎片 facts 检索 ──
         profile = _get_profile(agent_id)
         queries = profile.get("session_start_queries", ["recent decisions", "active projects"])
 
-        # 构建每个 scope 的召回任务（每个 query × 每个 scope）
         graphiti = await self._get_graphiti()
         per_query_k = max(1, top_k // len(queries))
 
@@ -273,6 +434,9 @@ class MemoryRetriever:
         if self._graphiti:
             await self._graphiti.close()
             self._graphiti = None
+        if self._driver:
+            await self._driver.close()
+            self._driver = None
 
 
 # ─── 便捷函数 ─────────────────────────────────────────────────────────────────

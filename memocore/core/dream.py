@@ -75,6 +75,17 @@ class DreamReport:
     expired: int = 0          # 超过 TTL 被删除的节点
     confidence_lowered: int = 0  # 置信度被降低的节点
 
+    # Phase 7 Compile
+    compiled_pages: int = 0       # 本次编译/更新的 CompiledPage 数
+    skipped_pages: int = 0        # 无新信息跳过的 CompiledPage 数
+
+    # Phase 8 Lint
+    lint_contradictions: int = 0
+    lint_orphans: int = 0
+    lint_missing: int = 0
+    lint_stale_pages: int = 0
+    lint_report_path: Optional[str] = None
+
     # 状态
     status: str = "running"   # running / done / failed
     error: Optional[str] = None
@@ -89,7 +100,9 @@ class DreamReport:
             f"节点={self.total_nodes} edges={self.total_edges} | "
             f"重复={self.duplicate_groups} 矛盾={self.conflict_pairs} "
             f"过期={self.stale_nodes} 到期删除={self.expired} 降权={self.confidence_lowered} | "
-            f"合并={self.merged} 更新={self.updated} 剪枝={self.pruned} 保留={self.kept}"
+            f"合并={self.merged} 更新={self.updated} 剪枝={self.pruned} 保留={self.kept} | "
+            f"编译={self.compiled_pages} lint矛盾={self.lint_contradictions} "
+            f"lint孤立={self.lint_orphans} lint缺页={self.lint_missing}"
         )
 
 
@@ -563,6 +576,368 @@ class DreamConsolidator:
             restored = rec["restored"] if rec else 0
             logger.info(f"[confidence] 恢复 {restored} 个活跃节点置信度")
 
+    # ── Phase 7: Compile — 知识编译 ─────────────────────────────────────────────
+
+    async def phase7_compile(self, agent_id: str, report: DreamReport):
+        """
+        将 Graph 中的碎片 facts 编译成结构化 CompiledPage 节点。
+
+        Karpathy 理念：知识应被编译一次，而非每次查询都从碎片重新推导。
+        CompiledPage 存储在 Neo4j 中（page_type=entity|concept|overview），
+        recall 时优先读取 CompiledPage 而非检索碎片 edges。
+
+        流程：
+        1. 找出所有有 edges 的实体节点
+        2. 对每个实体，收集其关联的所有 facts
+        3. 检查是否有已存在的 CompiledPage 且无新信息 → 跳过
+        4. 调用 LLM 将碎片 facts 编译成结构化 Markdown
+        5. MERGE 写入 CompiledPage 节点，建 COMPILED_FROM 边
+        6. 编译一个 overview（全局概览页）
+        """
+        logger.info(f"[compile] 开始知识编译 agent={agent_id}")
+        driver = await self._get_driver()
+
+        async with driver.session() as session:
+            # 7a. 找出所有有 edge 关联的实体
+            entity_q = """
+            MATCH (n {group_id: $gid})-[e]->()
+            WHERE n.name IS NOT NULL AND NOT n:CompiledPage
+            WITH n, count(e) AS edge_cnt, max(e.created_at) AS latest_edge
+            RETURN n.uuid AS uuid, n.name AS name, n.summary AS summary,
+                   n.entity_type AS entity_type,
+                   n.memocore_confidence AS confidence,
+                   edge_cnt, latest_edge
+            ORDER BY edge_cnt DESC
+            LIMIT $max_nodes
+            """
+            r = await session.run(entity_q, gid=agent_id, max_nodes=self.max_nodes_per_run)
+            entities = await r.data()
+            logger.info(f"[compile] 找到 {len(entities)} 个活跃实体")
+
+            if not entities:
+                return
+
+            compiled_count = 0
+            skipped_count = 0
+
+            for entity in entities:
+                entity_name = entity["name"]
+                entity_uuid = entity["uuid"]
+
+                # 7b. 检查是否需要重编译
+                existing_q = """
+                MATCH (p:CompiledPage {group_id: $gid, title: $title})
+                RETURN p.compiled_at AS compiled_at
+                """
+                r = await session.run(existing_q, gid=agent_id, title=entity_name)
+                existing = await r.single()
+
+                latest_edge = entity.get("latest_edge")
+                if existing and latest_edge and existing["compiled_at"]:
+                    try:
+                        compiled_str = str(existing["compiled_at"])[:19]
+                        edge_str = str(latest_edge)[:19]
+                        if compiled_str >= edge_str:
+                            skipped_count += 1
+                            continue  # 无新信息
+                    except Exception:
+                        pass  # 时间比较失败时总是重编译
+
+                # 7c. 收集该实体的所有 facts
+                facts_q = """
+                MATCH (a {group_id: $gid})-[e]->(b {group_id: $gid})
+                WHERE a.uuid = $uuid OR b.uuid = $uuid
+                RETURN a.name AS src, b.name AS tgt, e.fact AS fact,
+                       e.created_at AS created_at
+                ORDER BY e.created_at DESC
+                LIMIT 50
+                """
+                r = await session.run(facts_q, gid=agent_id, uuid=entity_uuid)
+                facts = await r.data()
+
+                if not facts:
+                    skipped_count += 1
+                    continue
+
+                # 7d. LLM 编译碎片 → 结构化知识
+                facts_text = "\n".join(
+                    f"- [{f.get('src', '?')} → {f.get('tgt', '?')}] {f.get('fact', '')}"
+                    for f in facts
+                )
+
+                confidence = entity.get("confidence") or 1.0
+                conf_label = "high" if confidence >= 0.7 else ("medium" if confidence >= 0.3 else "low")
+
+                compile_prompt = f"""你是知识编译器。将以下关于「{entity_name}」的碎片信息编译成一个结构化的知识页面。
+
+实体类型: {entity.get('entity_type', '未知')}
+当前置信度: {conf_label}
+
+碎片信息（{len(facts)} 条）:
+{facts_text}
+
+要求:
+1. 合并重复信息，去除冗余
+2. 如有矛盾，以最新的为准，旧的标注为「存疑」
+3. 按主题分段（如：概述、偏好、关系、近期动态）
+4. 用简洁的中文 Markdown 格式
+5. 不要编造碎片中没有的信息
+6. 总长度控制在 500 字以内"""
+
+                try:
+                    compiled_content = await chat_complete(
+                        prompt=compile_prompt,
+                        max_tokens=800,
+                        temperature=0.0,
+                    )
+                except Exception as e:
+                    logger.warning(f"[compile] LLM 编译「{entity_name}」失败: {e}")
+                    continue
+
+                # 7e. MERGE 写入 CompiledPage 节点
+                now_str = datetime.now(timezone.utc).isoformat()
+                upsert_q = """
+                MERGE (p:CompiledPage {group_id: $gid, title: $title})
+                SET p.content = $content,
+                    p.page_type = $page_type,
+                    p.confidence = $confidence,
+                    p.source_count = $source_count,
+                    p.compiled_at = $compiled_at,
+                    p.stale = false
+                """
+                await session.run(upsert_q,
+                    gid=agent_id,
+                    title=entity_name,
+                    content=compiled_content,
+                    page_type="entity",
+                    confidence=confidence,
+                    source_count=len(facts),
+                    compiled_at=now_str,
+                )
+
+                # 建 COMPILED_FROM 边（链接到源实体）
+                link_q = """
+                MATCH (p:CompiledPage {group_id: $gid, title: $title})
+                MATCH (n {group_id: $gid, uuid: $uuid})
+                MERGE (p)-[:COMPILED_FROM]->(n)
+                """
+                await session.run(link_q, gid=agent_id, title=entity_name, uuid=entity_uuid)
+
+                compiled_count += 1
+                logger.info(f"[compile] 编译「{entity_name}」完成 ({len(facts)} facts)")
+
+            # 7f. 编译全局 overview（如果有编译过的页面）
+            overview_q = """
+            MATCH (p:CompiledPage {group_id: $gid})
+            WHERE p.page_type = 'entity'
+            RETURN p.title AS title, p.confidence AS confidence, p.source_count AS source_count
+            ORDER BY p.source_count DESC
+            """
+            r = await session.run(overview_q, gid=agent_id)
+            all_pages = await r.data()
+
+            if all_pages:
+                page_index = "\n".join(
+                    f"- **{p['title']}** (facts: {p.get('source_count', 0)}, "
+                    f"confidence: {'high' if (p.get('confidence') or 1) >= 0.7 else 'medium' if (p.get('confidence') or 1) >= 0.3 else 'low'})"
+                    for p in all_pages
+                )
+
+                overview_prompt = f"""你是知识编译器。根据以下已编译的实体页面列表，写一段 200 字以内的总体概述，描述这个 Agent 记忆中的核心人物、关注领域和重要决策。
+
+已编译页面（{len(all_pages)} 个）:
+{page_index}
+
+要求: 简洁，不要罗列，提炼模式和核心信息。"""
+
+                try:
+                    overview_content = await chat_complete(
+                        prompt=overview_prompt, max_tokens=400, temperature=0.0
+                    )
+                    now_str = datetime.now(timezone.utc).isoformat()
+                    await session.run("""
+                        MERGE (p:CompiledPage {group_id: $gid, title: '__overview__'})
+                        SET p.content = $content, p.page_type = 'overview',
+                            p.compiled_at = $compiled_at, p.source_count = $cnt,
+                            p.stale = false
+                    """, gid=agent_id, content=overview_content,
+                        compiled_at=now_str, cnt=len(all_pages))
+                except Exception as e:
+                    logger.warning(f"[compile] overview 编译失败: {e}")
+
+            report.compiled_pages = compiled_count
+            report.skipped_pages = skipped_count
+            logger.info(
+                f"[compile] 完成: 编译={compiled_count} 跳过={skipped_count} 总页面={len(all_pages)}"
+            )
+
+    # ── Phase 8: Lint — 知识健康检查 ─────────────────────────────────────────────
+
+    async def phase8_lint(self, agent_id: str, report: DreamReport):
+        """
+        检查 CompiledPage 之间的问题，输出 Karpathy 风格的健康报告。
+
+        检查项:
+        1. 矛盾 — 不同页面对同一事实描述冲突
+        2. 孤立页 — 无入站 COMPILED_FROM 边的实体页（源数据已被清理）
+        3. 缺页 — 在 facts 中被频繁提及但无 CompiledPage
+        4. 过期页 — 编译时间超过 14 天且源实体有新数据
+
+        输出写入 ~/.memocore/reports/{agent_id}/ 目录
+        """
+        logger.info(f"[lint] 开始健康检查 agent={agent_id}")
+        driver = await self._get_driver()
+        sections = []
+
+        async with driver.session() as session:
+            # 8a. 编译状态统计
+            stats_q = """
+            MATCH (p:CompiledPage {group_id: $gid})
+            WHERE p.page_type = 'entity'
+            RETURN count(p) AS page_count
+            """
+            r = await session.run(stats_q, gid=agent_id)
+            rec = await r.single()
+            page_count = rec["page_count"] if rec else 0
+
+            total_facts_q = """
+            MATCH ()-[e {group_id: $gid}]->()
+            WHERE e.fact IS NOT NULL
+            RETURN count(e) AS cnt
+            """
+            r = await session.run(total_facts_q, gid=agent_id)
+            rec = await r.single()
+            total_facts = rec["cnt"] if rec else 0
+
+            sections.append(f"### 编译状态\n- 已编译实体页: {page_count}\n- 总 facts: {total_facts}")
+
+            # 8b. 矛盾检测 — 同一对实体之间有多条不同 facts
+            contradiction_q = """
+            MATCH (a {group_id: $gid})-[e1]->(b {group_id: $gid})
+            MATCH (a)-[e2]->(b)
+            WHERE e1.uuid < e2.uuid
+              AND e1.fact IS NOT NULL AND e2.fact IS NOT NULL
+              AND e1.fact <> e2.fact
+            RETURN a.name AS src, b.name AS tgt,
+                   e1.fact AS fact1, e2.fact AS fact2
+            LIMIT 20
+            """
+            r = await session.run(contradiction_q, gid=agent_id)
+            contradictions = await r.data()
+            report.lint_contradictions = len(contradictions)
+
+            if contradictions:
+                lines = [f"### 潜在矛盾 ({len(contradictions)})"]
+                for c in contradictions:
+                    lines.append(
+                        f"- **{c['src']}** -> **{c['tgt']}**\n"
+                        f"  - Fact A: {c['fact1'][:120]}\n"
+                        f"  - Fact B: {c['fact2'][:120]}"
+                    )
+                sections.append("\n".join(lines))
+
+            # 8c. 孤立 CompiledPage — 没有 COMPILED_FROM 边
+            orphan_q = """
+            MATCH (p:CompiledPage {group_id: $gid})
+            WHERE p.page_type = 'entity'
+              AND NOT (p)-[:COMPILED_FROM]->()
+            RETURN p.title AS title
+            """
+            r = await session.run(orphan_q, gid=agent_id)
+            orphans = await r.data()
+            report.lint_orphans = len(orphans)
+
+            if orphans:
+                lines = [f"### 孤立页面 ({len(orphans)})"]
+                for o in orphans:
+                    lines.append(f"- `{o['title']}` — 源实体已被清理，建议删除或重编译")
+                sections.append("\n".join(lines))
+
+            # 8d. 缺页 — 被频繁提及但无 CompiledPage 的实体名
+            missing_q = """
+            MATCH (n {group_id: $gid})
+            WHERE n.name IS NOT NULL
+              AND NOT n:CompiledPage
+              AND (n)--()
+            WITH n.name AS name, count{(n)--() } AS ref_count
+            WHERE ref_count >= 2
+            AND NOT EXISTS {
+                MATCH (p:CompiledPage {group_id: $gid, title: name})
+            }
+            RETURN name, ref_count
+            ORDER BY ref_count DESC
+            LIMIT 15
+            """
+            try:
+                r = await session.run(missing_q, gid=agent_id)
+                missing = await r.data()
+            except Exception:
+                # 旧版 Neo4j 不支持 count{} 语法，降级查询
+                missing_q_compat = """
+                MATCH (n {group_id: $gid})-[e]-()
+                WHERE n.name IS NOT NULL AND NOT n:CompiledPage
+                WITH n.name AS name, count(e) AS ref_count
+                WHERE ref_count >= 2
+                RETURN name, ref_count
+                ORDER BY ref_count DESC
+                LIMIT 15
+                """
+                r = await session.run(missing_q_compat, gid=agent_id)
+                candidates = await r.data()
+                # 手动排除已有 CompiledPage 的
+                existing_pages_q = """
+                MATCH (p:CompiledPage {group_id: $gid})
+                RETURN p.title AS title
+                """
+                r2 = await session.run(existing_pages_q, gid=agent_id)
+                existing_titles = {rec["title"] for rec in await r2.data()}
+                missing = [c for c in candidates if c["name"] not in existing_titles]
+
+            report.lint_missing = len(missing)
+
+            if missing:
+                lines = [f"### 缺失页面 ({len(missing)})"]
+                for m in missing:
+                    lines.append(f"- **{m['name']}** — 被引用 {m['ref_count']} 次，建议编译")
+                sections.append("\n".join(lines))
+
+            # 8e. 过期页 — 编译时间超过 14 天
+            stale_q = """
+            MATCH (p:CompiledPage {group_id: $gid})
+            WHERE p.page_type = 'entity'
+              AND p.compiled_at < $cutoff
+            RETURN p.title AS title, p.compiled_at AS compiled_at
+            """
+            cutoff_14d = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+            r = await session.run(stale_q, gid=agent_id, cutoff=cutoff_14d)
+            stale_pages = await r.data()
+            report.lint_stale_pages = len(stale_pages)
+
+            if stale_pages:
+                lines = [f"### 过期页面 ({len(stale_pages)})"]
+                for s in stale_pages:
+                    lines.append(f"- `{s['title']}` — 编译于 {str(s['compiled_at'])[:10]}，建议重编译")
+                sections.append("\n".join(lines))
+
+        # 8f. 写入报告文件
+        report_dir = Path.home() / ".memocore" / "reports" / agent_id
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_file = report_dir / f"{datetime.now().strftime('%Y-%m-%d')}.md"
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        report_md = (
+            f"## Memory Health Report — {agent_id} | {now_str}\n\n"
+            + "\n\n".join(sections)
+        )
+
+        if not (report.lint_contradictions or report.lint_orphans
+                or report.lint_missing or report.lint_stale_pages):
+            report_md += "\n\n*All clear — 未发现问题。*"
+
+        report_file.write_text(report_md, encoding="utf-8")
+        report.lint_report_path = str(report_file)
+        logger.info(f"[lint] 报告已写入 {report_file}")
+
 
 # ─── 主入口 ────────────────────────────────────────────────────────────────────
 
@@ -614,6 +989,15 @@ async def run_dream(
         if not dry_run:
             logger.info("[phase6] Confidence — 更新节点置信度评分")
             await consolidator.phase6_decay_confidence(agent_id, report)
+
+        # Phase 7: Compile — 知识编译（碎片 facts → 结构化 CompiledPage）
+        if not dry_run:
+            logger.info("[phase7] Compile — 编译结构化知识页面")
+            await consolidator.phase7_compile(agent_id, report)
+
+        # Phase 8: Lint — 知识健康检查
+        logger.info("[phase8] Lint — 健康检查")
+        await consolidator.phase8_lint(agent_id, report)
 
         report.status = "done"
         report.finished_at = datetime.now(timezone.utc)

@@ -489,6 +489,110 @@ def import_memories(file, agent, dry_run):
     click.echo(f"导入完成: 成功 {imported} 个，跳过 {skipped} 个")
 
 
+# ── browse ───────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--agent", default=None, help="Agent ID")
+@click.option("--entity", default=None, help="查看指定实体的编译知识")
+@click.option("--report", is_flag=True, help="显示最新 Lint 健康报告")
+def browse(agent, entity, report):
+    """浏览编译后的知识页面和 Lint 报告"""
+    agent_id = agent or get_agent_id()
+
+    if report:
+        # 显示最新的 Lint 报告
+        report_dir = Path.home() / ".memocore" / "reports" / agent_id
+        if not report_dir.exists():
+            click.echo(f"[{agent_id}] 尚无 Lint 报告（需先运行 Dream）")
+            return
+        reports = sorted(report_dir.glob("*.md"), reverse=True)
+        if not reports:
+            click.echo(f"[{agent_id}] 尚无 Lint 报告")
+            return
+        click.echo(reports[0].read_text(encoding="utf-8"))
+        return
+
+    async def _browse():
+        driver = await _get_neo4j_driver()
+        try:
+            async with driver.session() as session:
+                if entity:
+                    # 查看特定实体的编译页面
+                    q = """
+                    MATCH (p:CompiledPage {group_id: $gid, title: $title})
+                    RETURN p.content AS content, p.confidence AS confidence,
+                           p.source_count AS source_count, p.compiled_at AS compiled_at
+                    """
+                    r = await session.run(q, gid=agent_id, title=entity)
+                    rec = await r.single()
+                    if rec:
+                        return "single", rec
+                    return "not_found", entity
+
+                # 列出所有编译页面
+                q = """
+                MATCH (p:CompiledPage {group_id: $gid})
+                WHERE p.page_type = 'entity'
+                RETURN p.title AS title, p.confidence AS confidence,
+                       p.source_count AS source_count,
+                       p.compiled_at AS compiled_at
+                ORDER BY p.source_count DESC
+                """
+                r = await session.run(q, gid=agent_id)
+                pages = await r.data()
+
+                # 获取 overview
+                ov_q = """
+                MATCH (p:CompiledPage {group_id: $gid, title: '__overview__'})
+                RETURN p.content AS content
+                """
+                r = await session.run(ov_q, gid=agent_id)
+                ov = await r.single()
+                overview = ov["content"] if ov else None
+
+                return "list", (pages, overview)
+        finally:
+            await driver.close()
+
+    mode, data = _run(_browse())
+
+    if mode == "not_found":
+        click.echo(f"未找到实体「{data}」的编译知识")
+        click.echo("使用 `memocore browse` 查看所有已编译页面")
+        return
+
+    if mode == "single":
+        conf = f"{data['confidence']:.1f}" if data.get('confidence') else "—"
+        click.echo(f"\n[conf={conf} | facts={data.get('source_count', 0)} | "
+                   f"compiled={str(data.get('compiled_at', ''))[:10]}]\n")
+        click.echo(data.get("content", "(empty)"))
+        return
+
+    # mode == "list"
+    pages, overview = data
+
+    if not pages:
+        click.echo(f"[{agent_id}] 尚无编译知识（需先运行 Dream）")
+        click.echo("  运行: python -m memocore.core.dream --agent-id " + agent_id)
+        return
+
+    click.echo(f"\nMemocore 编译知识 — agent: {agent_id}")
+    click.echo("=" * 50)
+
+    if overview:
+        click.echo(f"\n{overview}\n")
+        click.echo("-" * 50)
+
+    click.echo(f"\n已编译实体页 ({len(pages)}):\n")
+    for p in pages:
+        conf = f"{p['confidence']:.1f}" if p.get('confidence') else "—"
+        compiled = str(p.get('compiled_at', ''))[:10]
+        click.echo(f"  {p['title']:20s}  conf={conf}  facts={p.get('source_count', 0):>3}  compiled={compiled}")
+
+    click.echo(f"\n查看详情: memocore browse --entity <实体名>")
+    click.echo(f"健康报告: memocore browse --report")
+
+
 # ── privacy-scan ─────────────────────────────────────────────────────────────────
 
 @cli.command(name="privacy-scan")
