@@ -45,7 +45,7 @@ def should_retrieve(prompt: str) -> bool:
     return True
 
 
-async def run(hook_input: dict) -> dict:
+async def run(hook_input: dict) -> str:
     """Main flow, returns additionalContext text."""
     prompt = hook_input.get("prompt", "")
     session_id = hook_input.get("session_id", "unknown")

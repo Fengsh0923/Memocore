@@ -23,6 +23,7 @@ import asyncio
 import json
 import os
 import sys
+import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -495,7 +496,7 @@ def import_memories(file, agent, dry_run):
                     await session.run(eq,
                         gid=target_agent,
                         src=e["src"], tgt=e["tgt"],
-                        uuid=e.get("uuid", ""),
+                        uuid=e.get("uuid") or str(_uuid.uuid4()),
                         fact=e["fact"],
                         created_at=e.get("created_at", ""),
                     )

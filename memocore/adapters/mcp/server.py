@@ -195,11 +195,16 @@ async def memory_recall(
     if err := _check_api_key(api_key):
         return err
 
-    resolved_agent_id = _resolve_agent_id(agent_id)
-    if team_id:
-        team_id = validate_scope_id(team_id, "team_id")
-    if tenant_id:
-        tenant_id = validate_scope_id(tenant_id, "tenant_id")
+    try:
+        resolved_agent_id = _resolve_agent_id(agent_id)
+        if team_id:
+            team_id = validate_scope_id(team_id, "team_id")
+        if tenant_id:
+            tenant_id = validate_scope_id(tenant_id, "tenant_id")
+    except ValueError as e:
+        logger.warning(f"memory_recall: invalid parameters: {e}")
+        return f"Invalid parameters: {e}"
+
     logger.info(
         f"memory_recall: agent={resolved_agent_id[:24]} session={session_id[:16]} "
         f"team={team_id} tenant={tenant_id} query={query[:50]}"
@@ -273,7 +278,12 @@ async def memory_session_start(
     if err := _check_api_key(api_key):
         return err
 
-    resolved_agent_id = _resolve_agent_id(agent_id)
+    try:
+        resolved_agent_id = _resolve_agent_id(agent_id)
+    except ValueError as e:
+        logger.warning(f"memory_session_start: invalid agent_id: {e}")
+        return f"Invalid agent_id: {e}"
+
     logger.info(
         f"memory_session_start: agent={resolved_agent_id[:24]} session={session_id[:16]} "
         f"team={team_id} tenant={tenant_id}"
@@ -344,8 +354,12 @@ async def memory_store(
     if err := _check_api_key(api_key):
         return err
 
-    resolved_agent_id = _resolve_agent_id(agent_id)
-    group_id = _scope_to_group_id(scope, resolved_agent_id, team_id, tenant_id)
+    try:
+        resolved_agent_id = _resolve_agent_id(agent_id)
+        group_id = _scope_to_group_id(scope, resolved_agent_id, team_id, tenant_id)
+    except ValueError as e:
+        logger.warning(f"memory_store: invalid parameters: {e}")
+        return f"Invalid parameters: {e}"
     logger.info(
         f"memory_store: agent={resolved_agent_id[:24]} session={session_id[:16]} "
         f"scope={scope} group={group_id[:24]} len={len(conversation)}"

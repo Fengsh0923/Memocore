@@ -160,7 +160,10 @@ def main():
         logger.error(f"failed to read hook input: {e}")
         return
 
-    asyncio.run(run(hook_input))
+    try:
+        asyncio.run(run(hook_input))
+    except Exception as e:
+        logger.error(f"stop_hook main flow failed: {e}")
 
 
 if __name__ == "__main__":
