@@ -53,12 +53,19 @@ Docker deployment:
     memocore:latest memocore-mcp --transport http --host 0.0.0.0 --port 8765
 """
 
+import hmac
 import logging
 import os
+import re
 import sys
 from typing import Optional
 
-from memocore.core.config import get_agent_id, get_sessions_dir, get_logs_dir, get_neo4j_config, validate_agent_id, validate_scope_id, make_safe_agent_key
+from memocore.core.config import get_agent_id, get_sessions_dir, get_logs_dir, get_neo4j_config, validate_agent_id, validate_identifier, validate_scope_id, make_safe_agent_key
+
+# ── Input size limits ────────────────────────────────────────────────────────
+MAX_CONVERSATION_BYTES = 64 * 1024  # 64 KB
+MAX_QUERY_BYTES = 2 * 1024          # 2 KB
+MAX_SOURCE_LEN = 64                 # source description
 
 logger = logging.getLogger("memocore.mcp")
 
@@ -117,7 +124,7 @@ def _check_api_key(provided_key: Optional[str]) -> Optional[str]:
     expected = os.environ.get("MEMOCORE_API_KEY", "").strip()
     if not expected:
         return None  # No API Key configured, skip auth
-    if not provided_key or provided_key.strip() != expected:
+    if not provided_key or not hmac.compare_digest(provided_key.strip(), expected):
         logger.warning("API Key authentication failed")
         return "Authentication failed: please provide a valid api_key parameter"
     return None
@@ -134,14 +141,26 @@ def _resolve_agent_id(agent_id: Optional[str]) -> str:
     return validate_agent_id(resolved)
 
 
+def _sanitize_session_id(session_id: str) -> str:
+    """Sanitize session_id: keep only safe characters, truncate to 32 chars."""
+    return re.sub(r'[^a-zA-Z0-9_\-]', '', session_id)[:32]
+
+
+def _sanitize_log(value: str, max_len: int = 50) -> str:
+    """Strip control characters from user input before logging."""
+    return value.replace('\n', '\\n').replace('\r', '\\r')[:max_len]
+
+
 def _is_first_message(session_id: str, agent_id: str) -> bool:
-    """Check if this is the first message in the session (isolated by agent_id)."""
+    """Check if this is the first message in the session (atomic, isolated by agent_id)."""
     agent_key = make_safe_agent_key(agent_id)
-    flag = get_sessions_dir() / f"mcp-{agent_key}-{session_id[:16]}.flag"
-    if flag.exists():
+    safe_session = _sanitize_session_id(session_id)
+    flag = get_sessions_dir() / f"mcp-{agent_key}-{safe_session}.flag"
+    try:
+        flag.open('x').close()  # atomic exclusive create
+        return True
+    except FileExistsError:
         return False
-    flag.touch()
-    return True
 
 
 # ── Multi-scope helpers ────────────────────────────────────────────────────────
@@ -195,6 +214,9 @@ async def memory_recall(
     if err := _check_api_key(api_key):
         return err
 
+    if len(query) > MAX_QUERY_BYTES:
+        return f"Query too large ({len(query)} bytes > {MAX_QUERY_BYTES})"
+
     try:
         resolved_agent_id = _resolve_agent_id(agent_id)
         if team_id:
@@ -205,9 +227,10 @@ async def memory_recall(
         logger.warning(f"memory_recall: invalid parameters: {e}")
         return f"Invalid parameters: {e}"
 
+    safe_sid = _sanitize_session_id(session_id)
     logger.info(
-        f"memory_recall: agent={resolved_agent_id[:24]} session={session_id[:16]} "
-        f"team={team_id} tenant={tenant_id} query={query[:50]}"
+        f"memory_recall: agent={resolved_agent_id[:24]} session={safe_sid[:16]} "
+        f"team={team_id} tenant={tenant_id} query={_sanitize_log(query)}"
     )
 
     try:
@@ -215,7 +238,7 @@ async def memory_recall(
         retriever = MemoryRetriever()
 
         try:
-            if _is_first_message(session_id, resolved_agent_id):
+            if _is_first_message(safe_sid, resolved_agent_id):
                 logger.info("memory_recall: first message, triggering full recall")
                 result = await retriever.retrieve_for_session_start(
                     agent_id=resolved_agent_id,
@@ -284,15 +307,19 @@ async def memory_session_start(
         logger.warning(f"memory_session_start: invalid agent_id: {e}")
         return f"Invalid agent_id: {e}"
 
+    safe_sid = _sanitize_session_id(session_id)
     logger.info(
-        f"memory_session_start: agent={resolved_agent_id[:24]} session={session_id[:16]} "
+        f"memory_session_start: agent={resolved_agent_id[:24]} session={safe_sid[:16]} "
         f"team={team_id} tenant={tenant_id}"
     )
 
     # Mark as initialized to prevent memory_recall from re-triggering full recall
     safe_agent = make_safe_agent_key(resolved_agent_id)
-    flag = get_sessions_dir() / f"mcp-{safe_agent}-{session_id[:16]}.flag"
-    flag.touch()
+    flag = get_sessions_dir() / f"mcp-{safe_agent}-{safe_sid}.flag"
+    try:
+        flag.open('x').close()
+    except FileExistsError:
+        pass
 
     try:
         from memocore.core.retriever import MemoryRetriever
@@ -360,8 +387,12 @@ async def memory_store(
     except ValueError as e:
         logger.warning(f"memory_store: invalid parameters: {e}")
         return f"Invalid parameters: {e}"
+
+    safe_sid = _sanitize_session_id(session_id)
+    # Sanitize source: only safe characters, limited length
+    safe_source = re.sub(r'[^a-zA-Z0-9 _\-.]', '', source)[:MAX_SOURCE_LEN]
     logger.info(
-        f"memory_store: agent={resolved_agent_id[:24]} session={session_id[:16]} "
+        f"memory_store: agent={resolved_agent_id[:24]} session={safe_sid[:16]} "
         f"scope={scope} group={group_id[:24]} len={len(conversation)}"
     )
 
@@ -371,12 +402,15 @@ async def memory_store(
     if len(conversation) < 100:
         return "Skipped: conversation too short (< 100 characters)"
 
+    if len(conversation) > MAX_CONVERSATION_BYTES:
+        return f"Store failed: conversation too large ({len(conversation)} bytes > {MAX_CONVERSATION_BYTES})"
+
     try:
         from memocore.core.extractor import extract_and_store
         result = await extract_and_store(
             conversation=conversation,
             agent_id=resolved_agent_id,
-            source_description=f"{source} | scope={scope} | session={session_id[:16]}",
+            source_description=f"{safe_source} | scope={scope} | session={safe_sid[:16]}",
             group_id=group_id,
         )
 
@@ -432,7 +466,8 @@ async def health_check(
         status["neo4j_connected"] = True
     except Exception as e:
         status["status"] = "degraded"
-        status["neo4j_error"] = str(e)
+        status["neo4j_error"] = "connection failed"
+        logger.error(f"health_check neo4j error: {e}")  # full details server-side only
 
     return status
 

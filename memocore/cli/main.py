@@ -35,11 +35,17 @@ except ImportError:
 
 from memocore.core.config import (
     get_agent_id, get_global_config_path, get_state_dir,
-    get_neo4j_config, write_global_config,
+    get_neo4j_config, write_global_config, validate_agent_id,
+    make_safe_agent_key,
 )
 
 
 # ── Helper functions ────────────────────────────────────────────────────────────────────
+
+def _resolve_agent(agent: str | None) -> str:
+    """Resolve and validate agent_id from CLI option or env var."""
+    return validate_agent_id(agent or get_agent_id())
+
 
 def _run(coro):
     return asyncio.run(coro)
@@ -138,7 +144,7 @@ def init():
 @click.option("--type", "entity_type", default=None, help="Filter by entity type (e.g. Judgment)")
 def list_memories(agent, limit, entity_type):
     """List recently written memory nodes"""
-    agent_id = agent or get_agent_id()
+    agent_id = _resolve_agent(agent)
 
     async def _run_list():
         driver = await _get_neo4j_driver()
@@ -191,7 +197,7 @@ def list_memories(agent, limit, entity_type):
 @click.option("--no-rerank", is_flag=True, help="Skip LLM rerank (faster)")
 def search(query, agent, top_k, no_rerank):
     """Semantic search of the memory graph"""
-    agent_id = agent or get_agent_id()
+    agent_id = _resolve_agent(agent)
 
     async def _run_search():
         from memocore.core.retriever import MemoryRetriever
@@ -222,7 +228,7 @@ def search(query, agent, top_k, no_rerank):
 @click.option("--agent", default=None, help="Agent ID (used to verify ownership)")
 def delete(uuid, force, agent):
     """Delete the memory node with the specified UUID"""
-    agent_id = agent or get_agent_id()
+    agent_id = _resolve_agent(agent)
 
     async def _preview():
         driver = await _get_neo4j_driver()
@@ -269,7 +275,7 @@ def delete(uuid, force, agent):
 @click.option("--agent", default=None, help="Agent ID (None shows all)")
 def stats(agent):
     """Display memory graph statistics"""
-    agent_id = agent or get_agent_id()
+    agent_id = _resolve_agent(agent)
 
     async def _run_stats():
         driver = await _get_neo4j_driver()
@@ -332,7 +338,7 @@ def stats(agent):
 @click.option("--limit", default=1000, show_default=True, help="Maximum number of nodes to export")
 def export_memories(agent, fmt, output, limit):
     """Export memories as JSON or Markdown format"""
-    agent_id = agent or get_agent_id()
+    agent_id = _resolve_agent(agent)
 
     async def _run_export():
         driver = await _get_neo4j_driver()
@@ -431,7 +437,7 @@ def import_memories(file, agent, dry_run):
         sys.exit(1)
 
     source_agent = export_data.get("agent_id", "unknown")
-    target_agent = agent or source_agent
+    target_agent = validate_agent_id(agent or source_agent)
     nodes = export_data.get("nodes", [])
     edges = export_data.get("edges", [])
 
@@ -459,7 +465,7 @@ def import_memories(file, agent, dry_run):
                         skipped += 1
                         continue
                     q = """
-                    MERGE (n {uuid: $uuid})
+                    MERGE (n {uuid: $uuid, group_id: $gid})
                     SET n.name = $name,
                         n.summary = $summary,
                         n.entity_type = $type,
@@ -517,11 +523,11 @@ def import_memories(file, agent, dry_run):
 @click.option("--report", is_flag=True, help="Show latest Lint health report")
 def browse(agent, entity, report):
     """Browse compiled knowledge pages and Lint reports"""
-    agent_id = agent or get_agent_id()
+    agent_id = _resolve_agent(agent)
 
     if report:
         # Display the latest Lint report
-        report_dir = get_state_dir() / "reports" / agent_id
+        report_dir = get_state_dir() / "reports" / make_safe_agent_key(agent_id)
         if not report_dir.exists():
             click.echo(f"[{agent_id}] No Lint report yet (run Dream first)")
             return

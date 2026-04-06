@@ -24,13 +24,16 @@ logger = logging.getLogger("memocore.bridge_read")
 
 
 def is_first_message(session_id: str, agent_id: str) -> bool:
-    """Check if this is the first message in the session (isolated by agent_id)."""
+    """Check if this is the first message in the session (atomic, isolated by agent_id)."""
+    import re
     agent_key = make_safe_agent_key(agent_id)
-    flag = get_sessions_dir() / f"bridge-{agent_key}-{session_id[:16]}.flag"
-    if flag.exists():
+    safe_sid = re.sub(r'[^a-zA-Z0-9_\-]', '', session_id)[:32]
+    flag = get_sessions_dir() / f"bridge-{agent_key}-{safe_sid}.flag"
+    try:
+        flag.open('x').close()
+        return True
+    except FileExistsError:
         return False
-    flag.touch()
-    return True
 
 
 def should_retrieve(prompt: str) -> bool:
