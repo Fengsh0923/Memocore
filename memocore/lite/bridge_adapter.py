@@ -175,10 +175,51 @@ def main_write():
     sys.exit(0)
 
 
+# ── Claude Code UserPromptSubmit hook ─────────────────────────────
+#
+# Claude Code hooks expect a JSON envelope on stdout:
+#   {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+#                           "additionalContext": "..."}}
+# Rather than a bare string (which is what the IM bridge consumes).
+# Same search logic, different output shape.
+
+
+def main_cc_prompt():
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        data = {}
+
+    recall_text = bridge_read(data)
+    if not recall_text or not recall_text.strip():
+        sys.exit(0)
+
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": recall_text,
+        }
+    }
+    print(json.dumps(output, ensure_ascii=False))
+    sys.exit(0)
+
+
+def main_cc_stop():
+    # Claude Code Stop hook payload is the same shape as bridge_write input
+    # (transcript + session_id), so reuse bridge_write directly.
+    main_write()
+
+
 # ── module entry points ───────────────────────────────────────────
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "write":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "read"
+    if mode == "write":
         main_write()
+    elif mode == "cc_prompt":
+        main_cc_prompt()
+    elif mode == "cc_stop":
+        main_cc_stop()
     else:
         main_read()

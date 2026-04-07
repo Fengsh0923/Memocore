@@ -22,15 +22,22 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "graphiti-core>=0.3",
-    "neo4j>=5.0",
+    # Core deps kept small enough to run memocore.lite with stdlib-only backend.
     "python-dotenv>=1.0",
     "pydantic>=2.0",
     "click>=8.0",
 ]
 
 [project.optional-dependencies]
-# LLM providers（至少安装一个）
+# Legacy graph-backed recall path (Graphiti + Neo4j). Required only if you
+# use memocore.core.retriever or memocore.adapters.{bridge,claude_code}.
+# memocore.lite (the recommended default) does not need these.
+legacy = [
+    "graphiti-core>=0.3",
+    "neo4j>=5.0",
+]
+
+# LLM providers (for legacy extractor only; lite does not call LLMs).
 llm = [
     "anthropic>=0.20",
     "openai>=1.0",
