@@ -203,6 +203,47 @@ class MemoryStore:
             # Malformed FTS query (e.g. only punctuation) — degrade to empty.
             return []
 
+    def recent_pages(
+        self,
+        prefix: str = "",
+        exclude_prefix: Optional[str] = None,
+        limit: int = 5,
+    ) -> list[dict]:
+        """List pages sorted by updated_at DESC (most recently updated first).
+
+        Used by the "short-term context" injection path: find the sessions
+        the agent most recently touched, not the ones whose path sorts high.
+
+        prefix:         restrict to pages whose path starts with this.
+        exclude_prefix: drop pages whose path starts with this (e.g. to
+                        exclude the *current* session from context lookup).
+        limit:          return at most N rows.
+        """
+        params: list = [self.agent_id]
+        sql = (
+            "SELECT page_path, updated_at, version, length(content) "
+            "FROM pages WHERE agent_id = ?"
+        )
+        if prefix:
+            sql += " AND page_path LIKE ?"
+            params.append(prefix + "%")
+        if exclude_prefix:
+            sql += " AND page_path NOT LIKE ?"
+            params.append(exclude_prefix + "%")
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
+
+        cur = self._conn.execute(sql, params)
+        return [
+            {
+                "page_path": r[0],
+                "updated_at": r[1],
+                "version": r[2],
+                "size": r[3],
+            }
+            for r in cur.fetchall()
+        ]
+
     # ── housekeeping ────────────────────────────────────────────────
 
     def page_count(self) -> int:

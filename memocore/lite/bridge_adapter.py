@@ -120,48 +120,48 @@ def main_read():
 
 
 def bridge_write(data: dict) -> int:
-    """Append session transcript to today's bridge_sessions page.
+    """Persist an IM bridge transcript as a per-session markdown page.
 
-    Returns number of turns appended. Idempotent on session_id: re-appending
-    the same session_id within the same day will append duplicate turns —
-    callers should only invoke this once per session end.
+    Uses the same sessions/<date>/<sid>.md layout as the Claude Code cc_stop
+    path, so session-oriented recall works uniformly regardless of whether
+    the session came from the IM bridge or a local Claude Code run.
+
+    Each call overwrites the page — the caller is expected to pass the
+    full transcript so far, not an incremental delta.
     """
     transcript = data.get("transcript", [])
     session_id = data.get("session_id", "unknown")
     if not transcript:
         return 0
 
-    db_path = get_db_path()
-    store = MemoryStore(str(db_path), agent_id=get_agent_id())
+    # Normalize the transcript into the same shape as parse_session_turns
+    turns = []
+    for turn in transcript:
+        role = turn.get("role", "?")
+        content = turn.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                c.get("text", "") for c in content
+                if isinstance(c, dict) and c.get("type") == "text"
+            )
+        content = content.strip()
+        if not content:
+            continue
+        turns.append({"role": role, "text": content, "ts": ""})
 
+    if not turns:
+        return 0
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    page_path = f"sessions/{today}/{session_id[:16]}.md"
+    markdown = format_session_markdown(turns, session_id)
+
+    store = MemoryStore(str(get_db_path()), agent_id=get_agent_id())
     try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        page_path = f"bridge_sessions/{today}.md"
-
-        existing = store.read_page(page_path) or f"# Bridge sessions — {today}\n"
-
-        block = [f"\n## session {session_id[:16]} @ {datetime.now().strftime('%H:%M:%S')}\n"]
-        for turn in transcript:
-            role = turn.get("role", "?")
-            content = turn.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    c.get("text", "") for c in content
-                    if isinstance(c, dict) and c.get("type") == "text"
-                )
-            content = content.strip()
-            if not content:
-                continue
-            # truncate long messages to keep the page browsable
-            if len(content) > 2000:
-                content = content[:2000] + " ..."
-            prefix = "**user**" if role == "user" else "**assistant**"
-            block.append(f"{prefix}: {content}\n")
-
-        store.write_page(page_path, existing + "\n".join(block))
-        return len(transcript)
+        store.write_page(page_path, markdown)
     finally:
         store.close()
+    return len(turns)
 
 
 def main_write():
@@ -180,7 +180,81 @@ def main_write():
 #   {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
 #                           "additionalContext": "..."}}
 # Rather than a bare string (which is what the IM bridge consumes).
-# Same search logic, different output shape.
+#
+# cc_prompt injects TWO pieces of context:
+#   1. FTS5-based recall of long-term memory (same as bridge_read)
+#   2. A short-term context window: the tail of the most recently updated
+#      OTHER sessions. This is what lets a new local Claude Code session
+#      know what was just discussed in an IM bridge conversation (or vice
+#      versa) — continuity across entry points without relying on FTS
+#      keyword overlap.
+
+
+def _tail_session_page(content: str, turn_limit: int = 4) -> str:
+    """Extract the last `turn_limit` '## Turn' blocks from a session page.
+
+    Session pages use markdown headers of the form '## Turn N — **role**',
+    so we split on those and keep the tail. This is more stable than
+    character-based truncation because it respects turn boundaries.
+    """
+    if not content:
+        return ""
+    marker = "\n## Turn "
+    parts = content.split(marker)
+    if len(parts) <= 1:
+        # Unexpected shape — fall back to character tail
+        return content[-1500:]
+    # parts[0] is the header block; parts[1:] are turns
+    tail = parts[-turn_limit:]
+    return marker.lstrip("\n") + marker.join(tail)
+
+
+def load_recent_session_context(
+    current_session_id: str,
+    session_limit: int = 2,
+    turns_per_session: int = 4,
+) -> str:
+    """Return a markdown block summarizing the tail of recent OTHER sessions.
+
+    Excludes the current session (which the model already has in context)
+    and returns at most `session_limit` sessions' tails.
+    """
+    db_path = get_db_path()
+    if not db_path.exists():
+        return ""
+
+    short_sid = (current_session_id or "")[:16]
+    store = MemoryStore(str(db_path), agent_id=get_agent_id())
+    try:
+        # Exclude the current session by constructing its sessions/*/sid.md
+        # prefix pattern. Cross-date is rare but possible — we fall back
+        # to filtering in Python.
+        recent = store.recent_pages(prefix="sessions/", limit=session_limit + 2)
+        out_blocks: list[str] = []
+        for p in recent:
+            if short_sid and short_sid in p["page_path"]:
+                continue  # skip current session
+            content = store.read_page(p["page_path"]) or ""
+            tail = _tail_session_page(content, turn_limit=turns_per_session)
+            if not tail.strip():
+                continue
+            out_blocks.append(
+                f"### from `{p['page_path']}`\n\n{tail}"
+            )
+            if len(out_blocks) >= session_limit:
+                break
+    finally:
+        store.close()
+
+    if not out_blocks:
+        return ""
+
+    return (
+        "\n--- recent session context ---\n"
+        "## Tail of recent other sessions (cross-entry-point continuity)\n\n"
+        + "\n\n".join(out_blocks)
+        + "\n\n--- end of session context ---"
+    )
 
 
 def main_cc_prompt():
@@ -190,14 +264,22 @@ def main_cc_prompt():
     except json.JSONDecodeError:
         data = {}
 
+    session_id = data.get("session_id", "")
+
+    # Long-term memory recall (FTS5 over all pages)
     recall_text = bridge_read(data)
-    if not recall_text or not recall_text.strip():
+
+    # Short-term context — tails of the most recent other sessions
+    session_context = load_recent_session_context(session_id)
+
+    combined = "\n".join(x for x in (recall_text, session_context) if x.strip())
+    if not combined.strip():
         sys.exit(0)
 
     output = {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": recall_text,
+            "additionalContext": combined,
         }
     }
     print(json.dumps(output, ensure_ascii=False))
