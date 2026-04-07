@@ -72,22 +72,36 @@ def should_retrieve(prompt: str) -> bool:
 
 
 def format_recall(hits: list[dict]) -> str:
-    """Render search hits as a markdown block for system prompt injection."""
+    """Render search hits as a markdown block for system prompt injection.
+
+    Hits may come from search_pages() (single-agent, no agent_id field) or
+    from search_all_agents() (cross-shrimp, with an agent_id field). We
+    render the agent_id when present so the LLM can tell who said what.
+    """
     if not hits:
         return ""
     lines = [
         "\n--- memocore-lite recall ---",
-        "## Relevant historical memory (FTS5 trigram match)",
+        "## Relevant historical memory (FTS5 trigram match, cross-shrimp)",
         "",
     ]
     for i, h in enumerate(hits, 1):
-        lines.append(f"{i}. **{h['page_path']}** — {h['snippet']}")
+        agent_tag = f"[{h['agent_id']}] " if h.get("agent_id") else ""
+        lines.append(f"{i}. {agent_tag}**{h['page_path']}** — {h['snippet']}")
     lines.append("")
     lines.append("--- end of recall ---")
     return "\n".join(lines)
 
 
 def bridge_read(data: dict) -> str:
+    """Recall memory for system prompt injection.
+
+    Uses search_all_agents so a query can surface hits from every Flying
+    Shrimp's memory (aoxia, tianxia, longxia, maixia, huxia, hexia, ...)
+    in a single FTS5 pass. The central aoxia.db holds every shrimp's
+    content under its own agent_id namespace, populated by the
+    import_flying_shrimp job.
+    """
     prompt = data.get("prompt", "").strip()
     if not should_retrieve(prompt):
         return ""
@@ -98,7 +112,7 @@ def bridge_read(data: dict) -> str:
 
     store = MemoryStore(str(db_path), agent_id=get_agent_id())
     try:
-        hits = store.search_pages(prompt, limit=5)
+        hits = store.search_all_agents(prompt, limit=8)
         return format_recall(hits)
     finally:
         store.close()
