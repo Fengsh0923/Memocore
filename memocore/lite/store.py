@@ -343,11 +343,11 @@ class MemoryStore:
     def search_all_agents(self, query: str, limit: int = 20) -> list[dict]:
         """Full-text search across ALL agent_id values in this DB.
 
-        The star-topology deployment keeps every Flying Shrimp's memory in
-        a single DB, each shrimp under its own agent_id namespace. This
-        method runs one FTS5 query over everything and tags each result
-        with its source agent_id, so the caller can render "who said it"
-        in the recall output.
+        The star-topology deployment keeps every participating agent's
+        memory in a single shared DB, each agent under its own agent_id
+        namespace. This method runs one FTS5 query over everything and
+        tags each result with its source agent_id, so the caller can
+        render "which agent said it" in the recall output.
 
         Differs from search_pages() in that it:
           - does NOT restrict results to self.agent_id

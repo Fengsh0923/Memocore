@@ -13,11 +13,11 @@ Why a separate submodule (vs. modifying memocore/core/):
 
 Public API:
     from memocore.lite import MemoryStore
-    store = MemoryStore("/path/to/agent.db", agent_id="aoxia")
+    store = MemoryStore("/path/to/agent.db", agent_id="my_agent")
     store.write_page("memory.md", "# Hello\n...")
     content = store.read_page("memory.md")
     pages = store.list_pages(prefix="project_")
-    hits = store.search_pages("Karpathy")
+    hits = store.search_pages("any query text")
 """
 
 from memocore.lite.store import MemoryStore

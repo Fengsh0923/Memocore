@@ -6,12 +6,13 @@ Uses the SQLite Online Backup API (sqlite3 Connection.backup), which:
 - Guarantees the target is a transactionally-consistent snapshot at the
   moment the backup finished (no WAL mid-state)
 - Writes a single .db file (no .db-wal / .db-shm sidecar), so the target
-  is safe to put on a file sync service like Nutstore.
+  is safe to put on a file sync service (Dropbox, iCloud, an enterprise
+  network drive, etc.) that would otherwise choke on SQLite's WAL files.
 
 Typical use:
     python -m memocore.lite.snapshot \
-        --source ~/.memocore-lite/aoxia.db \
-        --target "~/Nutstore Files/FS_KM/00_Agent_Sandbox/memocore_snapshots/aoxia.db"
+        --source /path/to/live/agent.db \
+        --target /path/to/snapshots/agent.db
 
 Safety:
 - Writes to <target>.tmp first, then atomically renames on success.

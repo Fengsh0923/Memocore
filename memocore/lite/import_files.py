@@ -3,9 +3,9 @@ Bulk-import a directory of markdown files into a MemoryStore.
 
 Usage:
     python -m memocore.lite.import_files \
-        --source ~/.claude/projects/-Users-shenfeng/memory \
-        --db ~/.memocore-lite/aoxia.db \
-        --agent-id aoxia
+        --source /path/to/markdown/dir \
+        --db /path/to/agent.db \
+        --agent-id my_agent
 
 Behavior:
 - Walks the source directory recursively for *.md files.
@@ -13,6 +13,10 @@ Behavior:
 - Idempotent: re-running over the same source updates pages whose content
   changed (version bumps), leaves unchanged ones alone.
 - Skips files larger than --max-size (default 1 MB) to avoid blob bloat.
+
+For multi-agent deployments (one central DB, many agent namespaces),
+prefer `memocore.lite.import_multi_agent` which reads a single config
+file describing all sources.
 """
 
 from __future__ import annotations

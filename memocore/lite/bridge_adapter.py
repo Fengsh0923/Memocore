@@ -48,16 +48,30 @@ from memocore.lite import MemoryStore
 
 
 def get_db_path() -> Path:
-    """Resolve the SQLite DB path. Override with MEMOCORE_LITE_DB env var."""
+    """Resolve the SQLite DB path.
+
+    Resolution order:
+      1. MEMOCORE_LITE_DB env var (fully qualified path)
+      2. ~/.memocore-lite/<agent_id>.db using the resolved agent_id
+
+    The default naming scheme lets multiple agents on the same host keep
+    their DBs separate without any extra configuration.
+    """
     override = os.environ.get("MEMOCORE_LITE_DB")
     if override:
         return Path(override).expanduser()
-    return Path("~/.memocore-lite/aoxia.db").expanduser()
+    return Path(f"~/.memocore-lite/{get_agent_id()}.db").expanduser()
 
 
 def get_agent_id() -> str:
-    """Resolve agent_id. Override with MEMOCORE_AGENT_ID env var."""
-    return os.environ.get("MEMOCORE_AGENT_ID", "aoxia")
+    """Resolve the current agent_id.
+
+    Override with MEMOCORE_AGENT_ID env var. Defaults to 'default' for a
+    single-agent deployment — set the env var to something meaningful
+    (your user id, your machine name, your agent's name) for multi-agent
+    setups.
+    """
+    return os.environ.get("MEMOCORE_AGENT_ID", "default")
 
 
 def should_retrieve(prompt: str) -> bool:
@@ -75,14 +89,15 @@ def format_recall(hits: list[dict]) -> str:
     """Render search hits as a markdown block for system prompt injection.
 
     Hits may come from search_pages() (single-agent, no agent_id field) or
-    from search_all_agents() (cross-shrimp, with an agent_id field). We
-    render the agent_id when present so the LLM can tell who said what.
+    from search_all_agents() (cross-agent, with an agent_id field). We
+    render the agent_id when present so the LLM can tell which agent
+    said what.
     """
     if not hits:
         return ""
     lines = [
         "\n--- memocore-lite recall ---",
-        "## Relevant historical memory (FTS5 trigram match, cross-shrimp)",
+        "## Relevant historical memory (FTS5 trigram match)",
         "",
     ]
     for i, h in enumerate(hits, 1):
@@ -96,11 +111,11 @@ def format_recall(hits: list[dict]) -> str:
 def bridge_read(data: dict) -> str:
     """Recall memory for system prompt injection.
 
-    Uses search_all_agents so a query can surface hits from every Flying
-    Shrimp's memory (aoxia, tianxia, longxia, maixia, huxia, hexia, ...)
-    in a single FTS5 pass. The central aoxia.db holds every shrimp's
-    content under its own agent_id namespace, populated by the
-    import_flying_shrimp job.
+    Uses search_all_agents so a query can surface hits from every agent
+    whose pages live in the central DB. The DB holds each agent's
+    content under its own agent_id namespace, populated either by
+    import_files (single-agent) or import_multi_agent (multi-agent
+    star topology).
     """
     prompt = data.get("prompt", "").strip()
     if not should_retrieve(prompt):

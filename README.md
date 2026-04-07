@@ -1,7 +1,31 @@
 # Memocore — AI Agent 持久化记忆层
 
 > 让你的 AI Agent 拥有持久、自愈的记忆。
-> 基于 [Graphiti](https://github.com/getzep/graphiti) + Neo4j 构建，支持 Claude Code Hooks / MCP / IM Bridge 多种接入方式。
+> 两条路径可选：**`memocore`**（Graphiti + Neo4j，图谱 + 向量召回）或
+> **[`memocore.lite`](memocore/lite/README.md)**（SQLite + FTS5，Karpathy 风格 markdown wiki）。
+> 支持 Claude Code Hooks / MCP / IM Bridge 多种接入方式。
+
+---
+
+## 两条路径怎么选？
+
+| | `memocore` (full) | `memocore.lite` |
+|---|---|---|
+| 核心思路 | LLM 提取实体 → 图谱 + 向量召回 | Karpathy 风格：LLM 编译 markdown → FTS5 召回 |
+| 存储 | Neo4j + Graphiti + 向量索引 | 一个 SQLite 文件 |
+| 外部依赖 | Neo4j / Graphiti / embedder / rerank LLM | Python stdlib `sqlite3` |
+| 写入路径的 LLM 调用 | 多次（extraction + embedding + rerank） | 零 |
+| 代码规模 | ~3000+ LOC | ~600 LOC |
+| 可调试性 | 需要 Neo4j Browser + 向量工具 | `sqlite3 agent.db` 命令行 |
+| 最擅长 | 跨 entity 的语义相似（改写的概念能召回） | LLM 维护的 markdown 页的词汇召回 |
+| 适合规模 | 数百万 entity 的跨企业查询 | 数千 agent × 数千页 / agent |
+
+- 默认的图谱 + 向量路径 → 继续往下看本 README
+- 更轻的 Karpathy 风格 → 看 [`memocore/lite/README.md`](memocore/lite/README.md)
+
+两条路径可以共存 — `memocore.lite` 是独立子模块，不 import `memocore.core`
+的任何东西，所以可以只装 lite（`pip install memocore`，不装 `[legacy]` extras），
+也可以两条路径都启用。
 
 ---
 
