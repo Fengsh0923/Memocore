@@ -62,24 +62,44 @@ async def run(hook_input: dict) -> str:
     try:
         first_message = is_first_message(session_id, agent_id)
 
-        if first_message:
-            logger.info(f"session={session_id[:16]} first message, triggering full recall")
+        if first_message and should_retrieve(prompt):
+            # FIX 2026-04-07: first-message recall used to call retrieve_for_session_start
+            # which returns a static "hot list" of CompiledPages ordered by source_count,
+            # ignoring the actual user prompt. That produced fixed-449-char noise on every
+            # session. Now use the user's first message as the query, with rerank.
+            logger.info(f"session={session_id[:16]} first message, prompt-based recall (rerank=on)")
+            context_text = await retriever.retrieve(
+                query=prompt,
+                agent_id=agent_id,
+                top_k=10,
+                use_rerank=True,
+            )
+            logger.info(
+                f"session={session_id[:16]} first message recall complete, "
+                f"chars={len(context_text)}"
+            )
+
+        elif first_message:
+            # First message but prompt is too short / greeting — fall back to overview page
+            logger.info(f"session={session_id[:16]} first message but short prompt, overview fallback")
             context_text = await retriever.retrieve_for_session_start(
                 agent_id=agent_id,
                 top_k=10,
             )
             logger.info(
-                f"session={session_id[:16]} full recall complete, "
+                f"session={session_id[:16]} overview fallback complete, "
                 f"chars={len(context_text)}"
             )
 
         elif should_retrieve(prompt):
-            logger.info(f"session={session_id[:16]} subsequent message, fast recall")
+            # FIX 2026-04-07: enable rerank for subsequent messages too — pure embedding
+            # similarity was too noisy ("管理后台页面" / unrelated entities surfaced).
+            logger.info(f"session={session_id[:16]} subsequent message, fast recall (rerank=on)")
             context_text = await retriever.retrieve(
                 query=prompt,
                 agent_id=agent_id,
                 top_k=5,
-                use_rerank=False,
+                use_rerank=True,
             )
             logger.info(
                 f"session={session_id[:16]} fast recall complete, "
