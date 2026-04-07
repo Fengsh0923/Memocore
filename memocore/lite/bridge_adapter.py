@@ -1,40 +1,39 @@
 """
-Memocore Lite — Bridge adapter.
+Memocore Lite — Bridge + Claude Code hook adapter.
 
-Drop-in replacements for memocore.adapters.bridge.{bridge_read,bridge_write}
-that use the SQLite KV store instead of Graphiti/Neo4j.
+Drop-in replacement for memocore.adapters.bridge.{bridge_read,bridge_write}
+and memocore.adapters.claude_code.{prompt_hook,stop_hook,mid_session_hook}
+that uses the SQLite KV store instead of Graphiti/Neo4j.
 
-Why a separate adapter:
-- The original bridge adapters depend on MemoryRetriever (Neo4j+Graphiti).
-- This adapter has zero external dependencies and uses MemoryStore directly.
-- Same stdin/stdout protocol as the originals, so the bridge hook shell
-  scripts only need to swap the python -m target.
+Why one adapter for everything:
+- Read path is identical: stdin prompt → FTS5 search → system prompt injection.
+  The only difference is the output envelope (plain text for IM bridge,
+  hookSpecificOutput JSON for Claude Code).
+- Write path is identical: stdin transcript → markdown page.
+- Having one module means one code path to audit, one place to fix bugs,
+  and argv-based mode selection keeps the shell hooks trivial.
 
-bridge_read protocol (stdin → stdout):
-    in:  {"prompt": str, "session_id": str, "is_first_message": bool?}
-    out: plain text to inject into system prompt (empty string = no recall)
+Modes (selected by argv[1]):
+    (default)    bridge read      — plain text recall
+    write        bridge write     — append transcript to bridge_sessions/
+    cc_prompt    Claude Code UserPromptSubmit — JSON-wrapped recall
+    cc_mid       Claude Code mid-session sync — persists in-progress session
+                 to SQLite on every user prompt, so a crash / disconnect
+                 before Stop doesn't lose the conversation.
+    cc_stop      Claude Code Stop — final session persist (same path as cc_mid)
 
-bridge_write protocol (stdin → stdout):
-    in:  {"transcript": [{"role": "user|assistant", "content": str}, ...],
-          "session_id": str}
-    out: ignored
-
-Recall strategy (matches the Karpathy spirit — no LLM extraction):
-    - First message: search_pages(prompt) returns top-K most-relevant pages.
-    - Fast recall (subsequent): same.
-    - The LLM gets snippets (FTS5 bm25-ranked) plus the option to ask for
-      full pages by name. Empty result returns empty string.
-
-Write strategy (deliberately minimal):
-    - No LLM extraction (which is what poisoned the old graph).
-    - Appends each session transcript to a single rolling page named
-      `bridge_sessions/YYYY-MM-DD.md`. The LLM (or a periodic batch job)
-      can later compile these raw conversations into wiki pages — that's
-      the Karpathy ingest step, done out-of-band.
+Persistence model for Claude Code sessions:
+    Claude Code already writes every turn to ~/.claude/projects/<cwd>/<sid>.jsonl
+    synchronously. We treat that JSONL file as the source of truth and
+    mirror it into memocore.lite on every UserPromptSubmit and Stop. One
+    SQLite page per session, path = sessions/<date>/<sid>.md.
+    Overwrites on every sync — JSONL is append-only so the latest dump is
+    always the full history.
 """
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import sys
@@ -205,10 +204,192 @@ def main_cc_prompt():
     sys.exit(0)
 
 
+# ── Claude Code session JSONL sync ────────────────────────────────
+#
+# Claude Code persists every turn to a session file as JSONL. We mirror
+# that file into memocore.lite on every UserPromptSubmit (cc_mid) and Stop
+# (cc_stop), so a crash / disconnect before Stop fires still leaves an
+# up-to-date copy in the shared memory layer.
+
+
+def find_session_file(session_id: str, cwd: Optional[str] = None) -> Optional[Path]:
+    """Locate the JSONL file for a given session_id under ~/.claude/projects/.
+
+    Claude Code stores sessions at ~/.claude/projects/<encoded-cwd>/<sid>.jsonl
+    where <encoded-cwd> replaces / with -. We try the cwd-derived path first
+    (fast path), then fall back to a glob across all projects (slow path).
+    """
+    if not session_id or session_id == "unknown":
+        return None
+
+    projects = Path("~/.claude/projects").expanduser()
+    if not projects.exists():
+        return None
+
+    # Fast path: derive the encoded cwd
+    if cwd:
+        encoded = cwd.replace("/", "-")
+        candidate = projects / encoded / f"{session_id}.jsonl"
+        if candidate.exists():
+            return candidate
+
+    # Slow path: glob (still fast in practice — <1000 projects)
+    matches = list(projects.glob(f"*/{session_id}.jsonl"))
+    return matches[0] if matches else None
+
+
+def parse_session_turns(jsonl_path: Path) -> list[dict]:
+    """Parse a Claude Code session JSONL into a flat list of {role, text, ts}.
+
+    Filters out thinking blocks, tool uses, tool results, system entries,
+    file-history-snapshots, and other internal bookkeeping. Keeps only the
+    text that would appear in a human-readable transcript.
+    """
+    turns = []
+    try:
+        with jsonl_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                t = obj.get("type")
+                if t not in ("user", "assistant"):
+                    continue
+
+                msg = obj.get("message") or {}
+                role = msg.get("role", t)
+                content = msg.get("content")
+                ts = obj.get("timestamp", "")
+
+                # Flatten content into a single text string
+                text_parts: list[str] = []
+                if isinstance(content, str):
+                    text_parts.append(content)
+                elif isinstance(content, list):
+                    for c in content:
+                        if not isinstance(c, dict):
+                            continue
+                        ctype = c.get("type")
+                        if ctype == "text":
+                            text = c.get("text") or ""
+                            if text.strip():
+                                text_parts.append(text)
+                        # deliberately skip: thinking, tool_use, tool_result,
+                        # image, document — these are not human transcript
+
+                text = "\n".join(text_parts).strip()
+                if not text:
+                    continue
+
+                turns.append({"role": role, "text": text, "ts": ts})
+    except (FileNotFoundError, PermissionError):
+        return []
+
+    return turns
+
+
+def format_session_markdown(turns: list[dict], session_id: str) -> str:
+    """Render turns as a human-browsable markdown page."""
+    lines = [
+        f"# Session {session_id[:16]}",
+        f"",
+        f"*{len(turns)} turns, last updated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*",
+        "",
+        "---",
+        "",
+    ]
+    for i, t in enumerate(turns, 1):
+        prefix = "**user**" if t["role"] == "user" else "**assistant**"
+        ts = t.get("ts", "")
+        ts_short = ts[:19].replace("T", " ") if ts else ""
+        lines.append(f"## Turn {i} — {prefix} {ts_short}")
+        lines.append("")
+        # truncate very long turns to keep the page browsable
+        text = t["text"]
+        if len(text) > 4000:
+            text = text[:4000] + "\n\n... [truncated]"
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def sync_session(session_id: str, cwd: Optional[str] = None) -> int:
+    """Mirror a Claude Code session JSONL into memocore.lite.
+
+    Returns number of turns persisted, or 0 if session file not found
+    or contains no user-visible content.
+    """
+    session_file = find_session_file(session_id, cwd=cwd)
+    if not session_file:
+        return 0
+
+    turns = parse_session_turns(session_file)
+    if not turns:
+        return 0
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    page_path = f"sessions/{today}/{session_id[:16]}.md"
+    content = format_session_markdown(turns, session_id)
+
+    store = MemoryStore(str(get_db_path()), agent_id=get_agent_id())
+    try:
+        store.write_page(page_path, content)
+    finally:
+        store.close()
+
+    return len(turns)
+
+
+def main_cc_mid():
+    """UserPromptSubmit hook — sync current session JSONL to SQLite.
+
+    This is the "incremental persistence" path. Called on every user prompt,
+    so even if the session crashes before Stop fires, the SQLite copy is
+    at most one turn behind.
+    """
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        data = {}
+
+    session_id = data.get("session_id", "unknown")
+    cwd = data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR")
+
+    try:
+        sync_session(session_id, cwd=cwd)
+    except Exception:
+        # Never block the user prompt flow on a sync error.
+        pass
+    sys.exit(0)
+
+
 def main_cc_stop():
-    # Claude Code Stop hook payload is the same shape as bridge_write input
-    # (transcript + session_id), so reuse bridge_write directly.
-    main_write()
+    """Stop hook — final session sync. Prefer JSONL source-of-truth over
+    the stdin transcript, falling back to bridge_write if we can't find
+    the session file (degenerate case)."""
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        data = {}
+
+    session_id = data.get("session_id", "unknown")
+    cwd = data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR")
+
+    try:
+        n = sync_session(session_id, cwd=cwd)
+        if n == 0:
+            # Session file not found — fall back to raw stdin transcript.
+            bridge_write(data)
+    except Exception:
+        pass
+    sys.exit(0)
 
 
 # ── module entry points ───────────────────────────────────────────
@@ -219,6 +400,8 @@ if __name__ == "__main__":
         main_write()
     elif mode == "cc_prompt":
         main_cc_prompt()
+    elif mode == "cc_mid":
+        main_cc_mid()
     elif mode == "cc_stop":
         main_cc_stop()
     else:
