@@ -50,7 +50,11 @@ def _get_openai_client():
                 api_key = os.getenv("OPENAI_API_KEY")
                 if not api_key:
                     raise RuntimeError("OPENAI_API_KEY is not set")
-                _openai_client = openai.AsyncOpenAI(api_key=api_key)
+                base_url = os.getenv("OPENAI_BASE_URL")
+                if base_url:
+                    _openai_client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+                else:
+                    _openai_client = openai.AsyncOpenAI(api_key=api_key)
     return _openai_client
 
 

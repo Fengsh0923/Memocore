@@ -81,9 +81,12 @@ def should_extract(transcript_text: str) -> bool:
     """Determine if extraction is worthwhile (filter short/trivial conversations)."""
     if len(transcript_text) < 200:
         return False
-    skip_keywords = ["hello", "test", "hi", "ping"]
+    import re
+    skip_keywords = {"hello", "test", "hi", "ping"}
     first_line = transcript_text.split("\n")[0].lower()
-    if any(k in first_line for k in skip_keywords):
+    # Word-boundary match to avoid false positives (e.g. "hi" inside "philosopher")
+    words = set(re.findall(r'\b[a-z]+\b', first_line))
+    if words & skip_keywords:
         return False
     return True
 

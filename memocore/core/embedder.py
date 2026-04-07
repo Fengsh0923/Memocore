@@ -19,12 +19,14 @@ import os
 import threading
 from typing import Iterable
 
+from graphiti_core.embedder.client import EmbedderClient
+
 logger = logging.getLogger("memocore.embedder")
 
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 
 
-class LocalEmbedder:
+class LocalEmbedder(EmbedderClient):
     """
     Local Embedder implementing the graphiti EmbedderClient interface.
     Prefers fastembed; falls back to sentence-transformers if unavailable.

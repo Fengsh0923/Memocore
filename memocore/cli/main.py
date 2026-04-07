@@ -182,8 +182,9 @@ def list_memories(agent, limit, entity_type):
     for r in records:
         conf = f"{r['confidence']:.1f}" if r.get('confidence') else "—"
         status = r.get('status') or 'confirmed'
-        created = (r.get('created_at') or '')[:10]
-        click.echo(f"  [{status:9s}|conf={conf}] {created}  {r.get('type', '?'):18s}  {r['name']}")
+        created = str(r.get('created_at') or '')[:10]
+        type_str = r.get('type') or '?'
+        click.echo(f"  [{status:9s}|conf={conf}] {created}  {type_str:18s}  {r['name']}")
         if r.get('summary'):
             click.echo(f"    {r['summary'][:80]}")
 
