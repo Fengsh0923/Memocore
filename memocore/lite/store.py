@@ -161,7 +161,7 @@ class MemoryStore:
                 cur = conn.execute(
                     """
                     SELECT p.page_path,
-                           snippet(pages_fts, 2, '[', ']', '...', 12) AS snippet,
+                           snippet(pages_fts, 2, '[', ']', '...', 40) AS snippet,
                            bm25(pages_fts) AS rank
                     FROM pages_fts
                     JOIN pages p ON p.rowid = pages_fts.rowid
@@ -261,6 +261,20 @@ class MemoryStore:
         row = cur.fetchone()
         return row[0] if row else None
 
+    def read_page_any_agent(self, page_path: str, agent_id: str) -> Optional[str]:
+        """Read a page by (agent_id, page_path) without restricting to self.agent_id.
+
+        Used by recall timeline expansion: search_all_agents returns hits
+        across every agent's namespace, and we need to fetch the full
+        content of a hit regardless of which agent owns it.
+        """
+        cur = self._conn.execute(
+            "SELECT content FROM pages WHERE agent_id = ? AND page_path = ?",
+            (agent_id, page_path),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
     def delete_page(self, page_path: str) -> bool:
         """Delete a page. Returns True if a row was deleted."""
         cur = self._conn.execute(
@@ -322,7 +336,7 @@ class MemoryStore:
             cur = self._conn.execute(
                 """
                 SELECT p.page_path,
-                       snippet(pages_fts, 2, '[', ']', '...', 12) AS snippet,
+                       snippet(pages_fts, 2, '[', ']', '...', 40) AS snippet,
                        bm25(pages_fts) AS rank
                 FROM pages_fts
                 JOIN pages p ON p.rowid = pages_fts.rowid
@@ -370,7 +384,7 @@ class MemoryStore:
                 """
                 SELECT p.agent_id,
                        p.page_path,
-                       snippet(pages_fts, 2, '[', ']', '...', 12) AS snippet,
+                       snippet(pages_fts, 2, '[', ']', '...', 40) AS snippet,
                        bm25(pages_fts) AS rank
                 FROM pages_fts
                 JOIN pages p ON p.rowid = pages_fts.rowid

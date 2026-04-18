@@ -36,6 +36,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -74,35 +75,116 @@ def get_agent_id() -> str:
     return os.environ.get("MEMOCORE_AGENT_ID", "default")
 
 
+_PRIVATE_RE = re.compile(r"<private>.*?</private>", re.DOTALL | re.IGNORECASE)
+
+
+def strip_private(text: str) -> str:
+    """Remove <private>...</private> blocks before persisting to DB.
+
+    Claude-mem inspired: content wrapped in <private> tags is visible in the
+    current conversation but never written to memocore, so it cannot be
+    recalled in future sessions. Use for API keys, tokens, transient context.
+    """
+    if not text or "<private" not in text.lower():
+        return text
+    return _PRIVATE_RE.sub("", text).strip()
+
+
 def should_retrieve(prompt: str) -> bool:
     p = prompt.strip()
     if len(p) < 5:
         return False
     greetings = {"hi", "hello", "hey", "ok", "yes", "no", "thanks", "bye"}
-    return p.lower() not in greetings
+    if p.lower() in greetings:
+        return False
+    # FTS5 trigram tokenizer has no IDF — English stopword matches ("the",
+    # "context", "good") rank strongly and pollute recall for generic English
+    # prompts. Skip recall when prompt has no CJK chars and the distinctive
+    # content (after dropping common stopwords) is too short to matter.
+    has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in p)
+    if not has_cjk:
+        stopwords = {
+            "the", "a", "an", "and", "or", "but", "if", "of", "to", "in",
+            "on", "at", "for", "with", "by", "from", "is", "are", "was",
+            "were", "be", "been", "being", "have", "has", "had", "do",
+            "does", "did", "will", "would", "can", "could", "should",
+            "may", "might", "must", "i", "you", "he", "she", "it", "we",
+            "they", "this", "that", "these", "those", "my", "your", "our",
+            "how", "what", "when", "where", "why", "who", "which", "still",
+            "keep", "good", "bad", "context", "simplify", "ux", "just",
+            "also", "some", "any", "all", "not", "no", "yes", "ok", "so",
+        }
+        tokens = [t for t in re.findall(r"[a-zA-Z]+", p.lower()) if t not in stopwords]
+        distinctive = "".join(tokens)
+        if len(distinctive) < 8:
+            return False
+    return True
 
 
 # ── bridge_read ───────────────────────────────────────────────────
 
 
-def format_recall(hits: list[dict]) -> str:
+def expand_timeline(content: str, query: str, window: int = 500) -> str:
+    """Return ±window chars of context around the first query-token match.
+
+    Claude-mem inspired layer-2: once search returns a hit, we fetch the
+    page and extract a meaningful slice around where the match happened,
+    instead of relying on FTS5's tiny snippet. Concentrates token budget
+    on the most relevant hits (typically top 2) while keeping recall
+    output bounded.
+
+    Falls back to the page's opening slice if no token matches (rare —
+    FTS5 matched but our naive token scan missed, e.g. trigram overlap).
+    """
+    if not content or not query:
+        return content[:window * 2] if content else ""
+    lowered = content.lower()
+    best_pos = -1
+    for tok in re.findall(r"\w+", query.lower()):
+        if len(tok) < 2:
+            continue
+        pos = lowered.find(tok)
+        if pos >= 0 and (best_pos < 0 or pos < best_pos):
+            best_pos = pos
+    if best_pos < 0:
+        return content[: window * 2]
+    start = max(0, best_pos - window)
+    end = min(len(content), best_pos + window)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(content) else ""
+    return f"{prefix}{content[start:end]}{suffix}"
+
+
+def format_recall(hits: list[dict], query: str = "", store=None, expand_top: int = 2) -> str:
     """Render search hits as a markdown block for system prompt injection.
 
-    Hits may come from search_pages() (single-agent, no agent_id field) or
-    from search_all_agents() (cross-agent, with an agent_id field). We
-    render the agent_id when present so the LLM can tell which agent
-    said what.
+    Two-layer output (claude-mem inspired):
+      - Top `expand_top` hits: fetched in full and sliced with expand_timeline
+        (~1000 chars each) — the budget-heavy, high-relevance band.
+      - Remaining hits: short FTS5 snippet only — the index band.
+
+    When store/query are not provided, falls back to pure snippet mode
+    (backward compatible for any caller that hasn't migrated).
     """
     if not hits:
         return ""
     lines = [
         "\n--- memocore-lite recall ---",
-        "## Relevant historical memory (FTS5 trigram match)",
+        "## Relevant historical memory",
         "",
     ]
     for i, h in enumerate(hits, 1):
         agent_tag = f"[{h['agent_id']}] " if h.get("agent_id") else ""
-        lines.append(f"{i}. {agent_tag}**{h['page_path']}** — {h['snippet']}")
+        header = f"{i}. {agent_tag}**{h['page_path']}**"
+        if store is not None and query and i <= expand_top:
+            content = store.read_page_any_agent(h["page_path"], h.get("agent_id", ""))
+            if content:
+                lines.append(header)
+                lines.append("```")
+                lines.append(expand_timeline(content, query, window=500))
+                lines.append("```")
+                continue
+        lines.append(f"{header} — {h['snippet']}")
     lines.append("")
     lines.append("--- end of recall ---")
     return "\n".join(lines)
@@ -128,7 +210,14 @@ def bridge_read(data: dict) -> str:
     store = MemoryStore(str(db_path), agent_id=get_agent_id())
     try:
         hits = store.search_all_agents(prompt, limit=8)
-        return format_recall(hits)
+        # FTS5 bm25() returns negative values; more negative = stronger match.
+        # Filter out weak hits (rank > threshold) so noise doesn't pollute the prompt.
+        # Default -0.5: passes solid multi-token matches, drops single-word accidents.
+        # Override via MEMOCORE_RECALL_THRESHOLD env var (e.g. "-1.0" = stricter).
+        threshold = float(os.environ.get("MEMOCORE_RECALL_THRESHOLD", "-0.5"))
+        hits = [h for h in hits if h.get("rank", 0) <= threshold]
+        expand_top = int(os.environ.get("MEMOCORE_EXPAND_TOP", "2"))
+        return format_recall(hits, query=prompt, store=store, expand_top=expand_top)
     finally:
         store.close()
 
@@ -173,7 +262,7 @@ def bridge_write(data: dict) -> int:
                 c.get("text", "") for c in content
                 if isinstance(c, dict) and c.get("type") == "text"
             )
-        content = content.strip()
+        content = strip_private(content.strip())
         if not content:
             continue
         turns.append({"role": role, "text": content, "ts": ""})
@@ -394,6 +483,7 @@ def parse_session_turns(jsonl_path: Path) -> list[dict]:
                         # image, document — these are not human transcript
 
                 text = "\n".join(text_parts).strip()
+                text = strip_private(text)
                 if not text:
                     continue
 
